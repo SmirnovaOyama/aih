@@ -8,6 +8,22 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-09-13
+
+### Fixed
+- **后台 agent 环境变量泄漏（第四轮 R4-F1，安全）**（`cli/src/jobs.ts`, `cli/src/teams.ts`,
+  `cli/src/env-policy.ts`）：`spawnJob` 此前把**全量 `process.env`** 传给后台 `aih run`
+  子进程——`GPG_PASSPHRASE` 及任意 KEY/TOKEN/SECRET 命名的变量带全值进入（与 v0.8.3 已修的
+  MCP env 泄漏同族）。现改用 `buildChildEnv()` 过滤环境，并**只回注 LLM provider key**
+  （新增 `LLM_API_KEY_ENVS` 导出：AIH/OPENAI/OPENCODE/OPENROUTER/GITHUB_COPILOT/
+  DEEPSEEK/GROQ/MISTRAL/XAI/MOONSHOT/ZHIPU/DASHSCOPE/SILICONFLOW/ANTHROPIC——父 env 存在
+  才回注）。`teams.ts dispatchTask` 去掉 env 透传。live-verify：LLM key 保留、secret 剔除、
+  PATH/HOME 透传。冒烟同步覆盖。
+- **readonly-allow 漏 find 写旗标（第四轮 R4-F2）**（`cli/src/readonly-allow.ts`）：
+  `find(1)` 的 `-fprintf/-fprint/-fprint0/-fls` 可写文件，此前黑名单只拦
+  `-delete/-exec/-execdir`——`find . -fprintf /etc/evil %p` 会被误判只读放行。
+  现补 4 旗标；冒烟增 D#14 断言（4 条全过）。
+
 ## [0.8.4] - 2026-09-13
 
 ### Fixed
