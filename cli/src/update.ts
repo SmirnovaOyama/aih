@@ -262,8 +262,18 @@ export function detectInstallDir(execPath: string = entryScript()): string | nul
   // we'd be running a dev checkout and "updating" would clobber the real
   // installed app in ~/.local/share/aih.
   if (!path.resolve(execPath).startsWith(installDir + path.sep)) return null;
-  if (fs.existsSync(path.join(installDir, "app", "aih"))) return installDir;
-  return null;
+  // Only the tarball layout (node ESM launcher) is auto-updatable. An OFFLINE
+  // install also has <dir>/app/aih, but it is a SHELL launcher (#!/bin/sh) that
+  // resolves a bundled/system node — overwriting it with the tarball's node
+  // launcher breaks the shell wrapper's `exec node"$APP/aih"` (self-reference →
+  // ERR_UNKNOWN_FILE_EXTENSION for the extensionless file), and the offline
+  // install is meant to be updated by re-running the offline installer. Refuse
+  // to auto-update a shell-launcher install; tell the user to reinstall offline.
+  const launcher = path.join(installDir, "app", "aih");
+  if (!fs.existsSync(launcher)) return null;
+  const head = fs.readFileSync(launcher, "utf8").slice(0, 64);
+  if (!head.startsWith("#!/usr/bin/env node")) return null;
+  return installDir;
 }
 
 // ---- download + apply ----------------------------------------------------------
