@@ -8,6 +8,35 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-13
+
+### Fixed
+- **发布供应链完整性（第三轮 T1 P1，安全）**（`scripts/package`, `scripts/install`,
+  `scripts/install.ps1`, `cli/src/update.ts`）：release tarball 此前**无任何校验和资产**——
+  篡改源或镜像可静默投毒。现在 `scripts/package` 生成 `SHASUMS256.txt`；`update.ts`
+  downloadTarball、`install`、`install.ps1` 在解包/使用前校验 sha256，不匹配即删除临时
+  文件并硬失败。**校验和从 GitHub 官方 asset 渠道直取，刻意绕过 `AIH_UPDATE_MIRROR`**——
+  镜像可换 payload 但无法同时伪造期望值；旧版本无 SHASUMS 时降级为明确警告而非硬失败。
+- **offline 打包凭据泄漏（第三轮 T1 P1，安全）**（`scripts/offline-package`）：合并配置
+  此前只扫 provider baseUrl，自定义 headers / envFile 里的真实凭据会**整包随离线包分发**。
+  现对全部顶层键递归扫描凭据形状（sk-/ghp_/github_pat_/xox/AKIA/AIza + api/key/token
+  key=value），命中即 stderr 报错并 exit 1；red→green 已验证。
+- **todo store 非原子写导致数据丢失（第三轮 T3 P1）**（`mcp-server/src/app-adapter.ts`）：
+  `persist` 原地写文件，崩溃/并发写者中断会留下截断 store，构造器静默当空加载（**全部
+  todo 消失**）。改为同目录 temp + `renameSync` 原子替换（与 `cli/src/atomic.ts` 同模式）；
+  冒烟断言无 `.tmp-` 残留。
+- **第三方 MCP 工具默认放行（第三轮 T3 P2，安全）**（`cli/src/mcp-backend.ts`）：
+  `parsePermission` 对无 `[kind=…, permission=…]` 后缀的第三方工具此前默认 `read/allow`——
+  未知 server 的写动作无需确认即执行。现默认 **`write/ask`**（人工确认；自有 mcp-server
+  恒附后缀）。probe-server 回归断言新增。
+- **webfetch HTML 实体越界（第三轮 T2 low）**（`cli/src/general-tools.ts`）：`&#(\d+);`
+  数字实体超 Unicode 上限时 `String.fromCodePoint` 抛 RangeError 中断抓取。现 clamp 到
+  `0x10FFFF`，非法值替换为 U+FFFD；`stripTags` 导出。\+2 断言。
+- **smoke 凭据形状断言恒真修复（第二轮遗留 r2 + 同区 r1）**（`cli/src/smoke.ts`）：
+  `redactSecrets` 的 sk-/ghp_ 形状测试用**源文件裸字面量**构造 token——该字面量被环境
+  脱敏回显为 `[REDACTED]`，源里两侧断言都变成恒真。现改为运行时 `join()` 拼接（源保持
+  纯形状不受脱敏），并加长度护栏；负控验证：改弱 ghp_ 形状 → smoke 立即 FAIL。
+
 ## [0.8.3] - 2026-09-13
 
 ### Fixed

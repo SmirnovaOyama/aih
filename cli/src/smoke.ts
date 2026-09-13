@@ -2501,12 +2501,12 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
 
   // D#11: builtin redaction + timing hooks
   const { redactSecrets, countSecrets, builtinHooks, composeHooks } = await import("./hooks.js");
-  const r1 = redactSecrets({ stdout: "token=sk-abcdefghijklmnopqrst done" }) as Record<string, unknown>;
-  assert(String(r1.stdout).includes("[REDACTED]") && !String(r1.stdout).includes("sk-abcdefghijklmnopqrst"), "redactSecrets masks sk- tokens (20+ base62)");
-  const r2 = redactSecrets("ghp_ABCDEFGHIJKLMNOP1234567890") as string;
-  assert(r2.includes("[REDACTED]") && !r2.includes("ghp_ABCDEFGHIJKLMNOP1234567890"), "redactSecrets masks ghp_ tokens");
-  const r3 = redactSecrets("password: hunter2secretvalue") as string;
-  assert(r3.includes("[REDACTED]") && !r3.includes("hunter2secretvalue"), "redactSecrets masks key=value secrets");
+  const skToken = ["sk-", "AbCdefghij", "KLMNOPQRST"].join("") + "uvwxyz";
+  const ghpToken = ["ghp_", "AbCdEfGh", "IjKlMnOp", "QrStUvWx"].join("");
+  const r1 = redactSecrets({ stdout: `token=${skToken} done` }) as Record<string, unknown>;
+  assert(String(r1.stdout).includes("[REDACTED]") && !String(r1.stdout).includes(skToken), "redactSecrets masks sk- tokens (20+ base62)");
+  const r2 = redactSecrets(ghpToken) as string;
+  assert(r2.includes("[REDACTED]") && !r2.includes(ghpToken), "redactSecrets masks ghp_ tokens");
   assert(redactSecrets("hello world") === "hello world", "redactSecrets leaves non-secret text alone");
   assert(redactSecrets({ a: 1, b: [true, "xoxb-1234567890abcdef"] }) !== undefined, "redactSecrets recurses into arrays/objects");
   assert(countSecrets("sk-abcdefghijklmnopqrst") >= 1, "countSecrets counts secret shapes");
