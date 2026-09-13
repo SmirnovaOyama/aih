@@ -8,6 +8,23 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-13
+
+### Fixed
+- **`aih workflow list` 不再执行工作流代码（第二轮 S1 P1，安全）**（`cli/src/index.ts`, `cli/src/workflow.ts`）：
+  `list` 此前经 `describeWorkflows` 对每个 `.aih/workflows/*.mjs` **动态 import 执行**仅为了读取描述——
+  只读命令会静默跑用户目录（或随仓库分发）的任意脚本。现 `list` 改用纯 `listWorkflows`
+  （只列文件名，不 import）；`describeWorkflows` 移出命令路径并注释为 opt-in 工具专用。冒烟新增
+  `bomb`/`sneaky` 回归：import 即 throw 的工作流在 `list` 下干净列出、不执行；`run`（用户点名）才
+  import 并暴露错误。live-verify：真实 `aih workflow list` 在含 import-throwing 模块的目录 exit 0 且列全。
+- **MCP server 子进程环境变量脱敏（第二轮 S3 P2，凭据泄漏面）**（`cli/src/mcp-backend.ts`,
+  `cli/src/env-policy.ts`）：`connectBackend` 此前把 **全量 `process.env`** 传给第三方 MCP server
+  子进程（`GPG_PASSPHRASE` 类 secret-named 变量带全值进入），绕过 `buildChildEnv` 防线。现改用
+  `buildChildEnv()`（与 `run_cmd` 子进程同一策略：剔除 KEY/TOKEN/SECRET/PASSPHRASE + `AIH_*API*`；
+  MCP server 是第三方进程，本就不需要 aih 自身凭据）；`buildChildEnv` 返回类型收窄为
+  `Record<string, string>`。冒烟新增 server-env probe（`GPG_TEST_PASSPHRASE`/`AIH_TEST_TOKEN` → null、
+  `PATH` 保留）；live-verify 真实 stdio spawn：server 视角 secret 字段全 null、`PATH` 正常。
+
 ## [0.8.2] - 2026-09-13
 
 ### Fixed
