@@ -4,6 +4,31 @@
 
 const SECRET_HINT = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL)/i;
 
+/**
+ * Provider API-key env var names (provider-catalog `apiKeyEnv` + the generic
+ * `AIH_API_KEY`). buildChildEnv() filters out every name matching SECRET_HINT
+ * — which would also strip the LLM credential a BACKGROUND agent (`aih run`)
+ * legitimately needs. Callers that spawn a child which itself runs an AI
+ * turn (jobs.ts spawnJob, teams dispatchTask) should re-inject exactly these
+ * names via `opts.set` when the value exists in the parent env.
+ */
+export const LLM_API_KEY_ENVS: readonly string[] = [
+  "AIH_API_KEY",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "OPENCODE_API_KEY",
+  "OPENROUTER_API_KEY",
+  "GITHUB_COPILOT_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "GROQ_API_KEY",
+  "MISTRAL_API_KEY",
+  "XAI_API_KEY",
+  "MOONSHOT_API_KEY",
+  "ZHIPU_API_KEY",
+  "DASHSCOPE_API_KEY",
+  "SILICONFLOW_API_KEY",
+] as const;
+
 export interface EnvPolicyOptions {
   /** Extra vars to force-set in the child env after filtering (Codex `set`). */
   set?: Record<string, string>;

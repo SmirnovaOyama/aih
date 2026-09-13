@@ -872,6 +872,10 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     assert(!isReadonlyCommand("curl http://evil"), "CC#54: curl rejected (not on list)");
     assert(!isReadonlyCommand("ls; rm x"), "CC#54: semicolon chaining rejected");
     assert(!isReadonlyCommand(""), "CC#54: empty command rejected");
+    assert(!isReadonlyCommand("find . -fprintf /tmp/out %p"), "D#14: find -fprintf rejected (write flag)");
+    assert(!isReadonlyCommand("find . -fprint /tmp/out"), "D#14: find -fprint rejected (write flag)");
+    assert(!isReadonlyCommand("find . -fprint0 /tmp/out"), "D#14: find -fprint0 rejected (write flag)");
+    assert(!isReadonlyCommand("find . -fls /tmp/out"), "D#14: find -fls rejected (write flag)");
 
     // Gate integration. SessionGate's ask path always prompts a human (CC#53
     // floor), so we attach a stub TUI whose askConfirm records the prompt and

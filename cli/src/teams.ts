@@ -314,8 +314,10 @@ export function dispatchTask(
   const { job, child } = spawnJob(cwd, prompt, {
     cli,
     node: opts.node,
-    env: opts.env,
     cwd: opts.cwd,
+    // env intentionally NOT passed: spawnJob builds a filtered env
+    // (buildChildEnv + LLM key re-injection) — dispatch must not leak the
+    // parent's full secret environment into the background agent.
   });
   task.session = job.session;
   task.out = job.out;

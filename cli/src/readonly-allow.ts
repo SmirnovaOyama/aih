@@ -48,6 +48,7 @@ export const READONLY_DEFENSIVE_BLACKLIST: readonly string[] = [
   "`", "$(", "${", "\\n",
   "sudo", "su ", "env ", "eval ", "exec ", "source ",
   "--pre", "--exec", "-exec", "-execdir", "-delete",
+  "-fprintf", "-fprint", "-fprint0", "-fls",
   "--pager", "--color=always", "--no-ignore",
   "sh -c", "bash -c", "zsh -c", "cmd /c",
   "rm ", "mv ", "cp ", "chmod", "chown", "mkdir", "touch", "tee ",

@@ -17,6 +17,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readJson } from "./read-json.js";
+import { buildChildEnv, LLM_API_KEY_ENVS } from "./env-policy.js";
 
 export type JobStatus = "running" | "done" | "failed" | "cancelled";
 
@@ -93,7 +94,8 @@ export interface SpawnJobOptions {
   cli?: string;
   /** node executable — defaults to process.execPath */
   node?: string;
-  /** env for the child (defaults to process.env) */
+  /** env for the child (default: buildChildEnv-filtered env with LLM keys
+   *  re-injected; pass a full override to replace it entirely) */
   env?: NodeJS.ProcessEnv;
   /** cwd for the child (defaults to the board cwd) */
   cwd?: string;
@@ -138,12 +140,22 @@ export function spawnJob(cwd: string, prompt: string, opts: SpawnJobOptions = {}
   const node = opts.node ?? process.execPath;
   const cli = opts.cli ?? process.argv[1] ?? "";
   const argv = opts.argv ?? [cli, "run", prompt, "--session", session, "--no-audit", "--no-stream", "--format", "text"];
+  // D#14 — the background agent (this child `aih run`) must keep the LLM
+  // credential it needs to run (buildRealLlm reads `process.env[apiKeyEnv]` /
+  // `AIH_API_KEY`), but must NOT inherit the rest of the parent's secret
+  // environment (GPG_PASSPHRASE, arbitrary KEY/TOKEN/SECRET…). base =
+  // buildChildEnv() filters those out; set re-injects ONLY the provider API
+  // keys that actually exist in the parent env, by their catalog names.
+  const llmKeyVars = LLM_API_KEY_ENVS.filter((v) => process.env[v] !== undefined);
+  const llmKeys: Record<string, string> = {};
+  for (const v of llmKeyVars) llmKeys[v] = process.env[v] as string;
+  const childEnv = buildChildEnv(process.env, { set: llmKeys });
   const child = spawn(
     node,
     argv,
     {
       cwd: opts.cwd ?? cwd,
-      env: opts.env ?? process.env,
+      env: opts.env ?? childEnv,
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
