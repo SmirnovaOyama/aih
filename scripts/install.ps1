@@ -79,7 +79,42 @@ function Get-Tarball {
         Write-Err "download failed — check https://github.com/$GitHubRepo/releases/tag/v$Ver"
     }
 
+    Verify-TarballSum -Tarball $tarball -Ver $Ver -GitHubRepo $GitHubRepo
+
     return @{ Tarball = $tarball; TmpDir = $tmpDir }
+}
+
+# T1 P1 — verify sha256 against the release SHASUMS256.txt asset (fetched from
+# GitHub's OWN asset channel, never a mirror, so a tampered payload cannot also
+# fake the expected sum). Skips cleanly when the asset is absent.
+function Verify-TarballSum {
+    param([string]$Tarball, [string]$Ver, [string]$GitHubRepo)
+    $sumsUrl = "https://github.com/$GitHubRepo/releases/download/v$Ver/SHASUMS256.txt"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $sums = [string](Invoke-WebRequest -Uri $sumsUrl -UseBasicParsing -ErrorAction Stop).Content
+    } catch {
+        Write-Warn "no SHASUMS256.txt asset — skipping integrity check"
+        return
+    }
+    $expected = $null
+    $name = Split-Path $Tarball -Leaf
+    foreach ($line in ($sums -split "`n")) {
+        if ($line.TrimEnd().EndsWith($name)) {
+            $expected = ($line.Trim() -split '\s+')[0]
+            break
+        }
+    }
+    $expected = ([string]$expected).ToLower()
+    if ($expected.Length -ne 64 -or -not ($expected -replace '[0-9a-f]', '' -eq '')) {
+        Write-Warn "SHASUMS256.txt entry unreadable — skipping integrity check"
+        return
+    }
+    $actual = (Get-FileHash -Algorithm SHA256 -Path $Tarball).Hash.ToLower()
+    if ($actual -ne $expected) {
+        Write-Err "checksum mismatch: expected $expected, got $actual — download was tampered with"
+    }
+    Write-Ok "checksum verified ($($expected.Substring(0,12))...)"
 }
 
 # ── extract ───────────────────────────────────────────────────────────

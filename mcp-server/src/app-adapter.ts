@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, basename } from "node:path";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 
 export type PermissionAction = "allow" | "ask" | "deny";
@@ -57,11 +58,16 @@ export class TodoAppAdapter implements AppAdapter {
 
   #persist(): void {
     if (!this.#storePath) return;
-    writeFileSync(
-      this.#storePath,
-      JSON.stringify({ todos: this.#todos, nextId: this.#nextId }, null, 2),
-      "utf8",
-    );
+    // T3 P1 — atomic write (temp + same-dir rename), same pattern as
+    // cli/src/atomic.ts publishFile: a crash or concurrent writer mid-write
+    // used to leave a TRUNCATED store that the constructor silently loaded
+    // as an empty todo list (data loss). rename() over an existing file is
+    // atomic on POSIX and Windows, so readers never see a partial file.
+    const data = JSON.stringify({ todos: this.#todos, nextId: this.#nextId }, null, 2);
+    const dir = dirname(this.#storePath);
+    const tmp = `${dir}/${basename(this.#storePath)}.tmp-${process.pid}`;
+    writeFileSync(tmp, data, "utf8");
+    renameSync(tmp, this.#storePath);
   }
 
   readonly descriptor: AppDescriptor = {

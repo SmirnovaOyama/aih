@@ -111,6 +111,13 @@ async function main(): Promise<void> {
   const reader = new TodoAppAdapter(storePath);
   const stats = (await reader.context("stats")) as { total: number };
   assert(stats.total === 1, "todo store persists across adapter instances");
+  // T3 P1 — atomic persist (temp + rename): a completed write must leave
+  // exactly the final file and no *.tmp-* stragglers in the store dir.
+  const { readdirSync } = await import("node:fs");
+  assert(
+    !readdirSync(tmpdir()).some((f) => f.startsWith("aih-todo") && f.includes(".tmp-")),
+    "todo store atomic write leaves no .tmp- stragglers",
+  );
   rmSync(storePath, { force: true });
 
   process.exit(0);

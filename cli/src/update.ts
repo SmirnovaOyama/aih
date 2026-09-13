@@ -20,6 +20,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 
 export const GITHUB_REPO = "summit4you/aih";
 const API = `https://api.github.com/repos/${GITHUB_REPO}/releases`;
@@ -304,7 +305,45 @@ export async function downloadTarball(version: string, destDir: string): Promise
   }
   const buf = Buffer.from(await res.arrayBuffer());
   fs.writeFileSync(dest, buf);
+  // T1 P1 — integrity check against the release's SHASUMS256.txt asset. The
+  // sum is fetched from GitHub's asset channel DIRECTLY (never through the
+  // mirror), so a rogue/compromised AIH_UPDATE_MIRROR can swap the payload
+  // but cannot also swap the expected sum. Missing SHASUMS asset (older
+  // releases) → warn-and-continue so updates never regress to hard failure.
+  const expected = await expectedSha256(version);
+  if (expected) {
+    const actual = crypto.createHash("sha256").update(buf).digest("hex");
+    if (actual !== expected) {
+      fs.rmSync(dest, { force: true });
+      throw new Error(
+        `tarball checksum mismatch: expected sha256 ${expected.slice(0, 12)}…, got ${actual.slice(0, 12)} — ` +
+          "the download (or its mirror) was tampered with; retry without AIH_UPDATE_MIRROR or re-download",
+      );
+    }
+  } else {
+    console.error("[aih] note: no SHASUMS256.txt asset for this release — skipping integrity check");
+  }
   return { tarball: dest, bytes: buf.length };
+}
+
+/** Expected sha256 for `aih-<version>-node.tar.gz` from the release's
+ *  SHASUMS256.txt asset, or null when absent/unreachable. */
+async function expectedSha256(version: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${DL}/v${version}/SHASUMS256.txt`, {
+      signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
+    }); // deliberately NOT mirrored — the sum must come from GitHub itself
+    if (!res.ok) return null;
+    const text = await res.text();
+    const line = text
+      .split("\n")
+      .find((l) => l.trimEnd().endsWith(tarballName(version)));
+    if (!line) return null;
+    const hex = line.trim().split(/\s+/)[0];
+    return /^[0-9a-f]{64}$/i.test(hex) ? hex.toLowerCase() : null;
+  } catch {
+    return null;
+  }
 }
 
 export interface ApplyResult {

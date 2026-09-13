@@ -97,6 +97,13 @@ echo "==> sanity: launcher resolves from the staged tree"
 mkdir -p "$OUT_DIR"
 TARBALL="$OUT_DIR/aih-$VERSION-node.tar.gz"
 tar -czf "$TARBALL" -C "$STAGE" .
+# T1 P1 — publish sha256 of the tarball as a release asset (SHASUMS256.txt).
+# Verifiers (update.ts / scripts/install) fetch the sum from GitHub's OWN
+# asset channel, NOT through AIH_UPDATE_MIRROR, so a compromised/ rogue mirror
+# cannot swap both the payload and the checksum. Nodejs SHASUMS format:
+# "  <hex>  <filename>" (float/verify convention).
+echo "$( (sha256sum "$TARBALL" 2>/dev/null || shasum -a 256 "$TARBALL") | awk '{print $1}')  $(basename "$TARBALL")" > "$OUT_DIR/SHASUMS256.txt"
+echo "==> wrote $OUT_DIR/SHASUMS256.txt"
 echo "==> packaged $TARBALL ($(du -h "$TARBALL" | cut -f1))"
 echo ""
 echo "  Release steps:"

@@ -186,10 +186,20 @@ function decodeEntities(text: string): string {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
+    .replace(/&#(\d+);/g, (_, n) => {
+      // T2 — clamp: a hostile page can send &#999999999; → RangeError
+      // (webfetch dies instead of returning sanitized text). Out-of-range
+      // codepoints become U+FFFD like browsers do.
+      try {
+        const cp = Number(n);
+        return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : "\uFFFD";
+      } catch {
+        return "\uFFFD";
+      }
+    });
 }
 
-function stripTags(html: string): string {
+export function stripTags(html: string): string {
   return decodeEntities(
     html
       .replace(/<script[\s\S]*?<\/script>/gi, " ")

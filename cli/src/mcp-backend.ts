@@ -42,7 +42,12 @@ function parsePermission(description: string): {
       cleanDescription: description.replace(PERMISSION_SUFFIX, "").trim(),
     };
   }
-  return { kind: "read", permission: "allow", cleanDescription: description.trim() };
+  // T3 P2 — fail-safe default for third-party servers without the permission
+  // suffix: the old default (read/allow) classified unknown servers' write
+  // actions as auto-allowed. write/ask keeps the tool usable (human confirms)
+  // instead of silently permitting. Our own mcp-server always appends the
+  // suffix, so this only affects external servers.
+  return { kind: "write", permission: "ask", cleanDescription: description.trim() };
 }
 
 function extractText(result: unknown): unknown {

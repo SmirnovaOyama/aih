@@ -1118,6 +1118,47 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     console.log("ok: CC#56 MCP string args normalize to typed objects");
   }
 
+  // T3 P2 — permission-suffix parse fail-safe: third-party MCP tools without
+  // the [kind=…, permission=…] suffix used to default to read/allow (write
+  // actions auto-permitted). Now write/ask (human confirms).
+  {
+    // parsePermission is module-private; test the observable behavior instead:
+    // a backend whose server description lacks the suffix must NOT come out
+    // read/allow. Expose check via connectBackend's listTools against a probe
+    // server with a bare description.
+    const probeDir = ".aih-smoke-mcp-bare";
+    rmSync(probeDir, { recursive: true, force: true });
+    mkdirSync(probeDir, { recursive: true });
+    writeFileSync(
+      `${probeDir}/server-bare.mjs`,
+      `
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+const srv = new Server({ name: "bare", version: "1" }, { capabilities: { tools: {} } });
+srv.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [{ name: "kick", description: "does something (no permission suffix)", inputSchema: { type: "object", properties: {} } }],
+}));
+srv.setRequestHandler(CallToolRequestSchema, async () => ({ content: [{ type: "text", text: "done" }] }));
+await srv.connect(new StdioServerTransport());
+`.trim(),
+    );
+    const { connectBackend } = await import("./mcp-backend.js");
+    const b = await connectBackend(process.execPath, [`${probeDir}/server-bare.mjs`], { quiet: true });
+    try {
+      const defs = await b.listTools();
+      const kick = defs.find((d) => d.name === "kick");
+      assert(
+        !!kick && kick.kind === "write" && kick.permission === "ask",
+        "T3 P2: MCP tool without permission suffix defaults to write/ask (fail-safe), not read/allow",
+      );
+    } finally {
+      b.close();
+      rmSync(probeDir, { recursive: true, force: true });
+    }
+    console.log("ok: T3 P2 bare MCP tool fail-safe default");
+  }
+
 
   // lastContextTokens: compaction-aware seeding. When the newest turn-boundary
   // is a compaction event (no LLM turn ran since), the stamped post-compaction
@@ -2156,6 +2197,7 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
     FETCH_UA_HONEST,
     FETCH_DEFAULT_TIMEOUT_MS,
     FETCH_MAX_TIMEOUT_MS,
+    stripTags,
   } = await import("./general-tools.js");
   const workdir = ".aih-smoke-general";
   rmSync(workdir, { recursive: true, force: true });
@@ -2180,7 +2222,10 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
   );
   const globRes = await call("glob", { pattern: "*.ts" });
   assert((globRes.files as string[]).includes("src/app.ts"), "glob finds files at any depth");
-  const grepRes = await call("grep", { pattern: "const a", include: "*.ts" });
+  // T2 — entity decode must NOT RangeError on hostile codepoints (&#999999999;):
+  // out-of-range becomes U+FFFD (browser-like), valid ones still decode.
+  assert(stripTags("<p>a&#999999999;b</p>").includes("a"), "stripTags survives out-of-range numeric entities (no RangeError)");
+  assert(stripTags("&#65;&#66;").trim() === "AB", "stripTags still decodes in-range numeric entities");  const grepRes = await call("grep", { pattern: "const a", include: "*.ts" });
   assert((grepRes.matches as unknown[]).length === 1, "grep matches file contents");
   await call("todo", { todos: [{ content: "x", status: "in_progress" }, { content: "y", status: "pending" }] });
   assert(existsSync(`${workdir}/.aih/todos.json`), "todo persists the list");
