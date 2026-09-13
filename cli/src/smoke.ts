@@ -2669,6 +2669,25 @@ await srv.connect(new StdioServerTransport());
 `.trim();
   writeFileSync(`${mcpDir}/server-a.mjs`, serverSrc("a", "pong-a"));
   writeFileSync(`${mcpDir}/server-b.mjs`, serverSrc("b", "pong-b"));
+  const serverEnvSrc = `\nimport { Server } from \"@modelcontextprotocol/sdk/server/index.js\";\nimport { ListToolsRequestSchema, CallToolRequestSchema } from \"@modelcontextprotocol/sdk/types.js\";\nimport { StdioServerTransport } from \"@modelcontextprotocol/sdk/server/stdio.js\";\nconst srv = new Server({ name: \"envprobe\", version: \"1\" }, { capabilities: { tools: {} } });\nsrv.setRequestHandler(ListToolsRequestSchema, async () => ({\n  tools: [{ name: \"check\", description: \"env check\", inputSchema: { type: \"object\", properties: {} } }],\n}));\nsrv.setRequestHandler(CallToolRequestSchema, async () => ({\n  content: [{ type: \"text\", text: JSON.stringify({\n    gpg: process.env.GPG_TEST_PASSPHRASE ?? null,\n    aihtoken: process.env.AIH_TEST_TOKEN ?? null,\n    path: process.env.PATH ?? null,\n  }) }],\n}));\nawait srv.connect(new StdioServerTransport());\n`.trim();
+  writeFileSync(`${mcpDir}/server-env.mjs`, serverEnvSrc);
+  const single = await (async () => {
+    const { connectBackend } = await import("./mcp-backend.js");
+    return connectBackend(process.execPath, [`${mcpDir}/server-env.mjs`], { quiet: true });
+  })();
+  try {
+    const envDefs = await single.listTools();
+    const pingDef = envDefs.find((d) => d.name === "check");
+    const envJson = (await (pingDef as unknown as { execute: (args?: unknown) => Promise<unknown> }).execute({})) as {
+      gpg: string | null;
+      aihtoken: string | null;
+      path: string | null;
+    };
+    assert(envJson.gpg === null && envJson.aihtoken === null, "MCP server child env strips secret-named vars (PASSPHRASE/TOKEN)");
+    assert(envJson.path !== null, "MCP server child env keeps benign vars (PATH)");
+  } finally {
+    single.close();
+  }
   const multi = await connectMultiBackend([
     { name: "srv-a", command: process.execPath, args: [`${mcpDir}/server-a.mjs`] },
     { name: "srv-b", command: process.execPath, args: [`${mcpDir}/server-b.mjs`] },
@@ -4571,7 +4590,28 @@ process.exit(ok === false ? 0 : 1);`;
     ] };`,
   );
   const list = wfRun(["workflow", "list"]);
-  assert(list.status === 0 && list.stdout.includes("good") && list.stdout.includes("2 phase(s)"), "workflow list shows name + phase count");
+  assert(list.status === 0 && list.stdout.includes("good") && !list.stdout.includes("2 phase(s)"), "workflow list shows name only (no import, so no phase count)");
+
+  // S1 P1 regression: `list` must NOT execute the workflow module. A module
+  // that throws at import time must still list cleanly; only `run` (which
+  // the user asked for by name) imports it and surfaces the error. A
+  // side-effecting module must not stamp globals during `list`.
+  writeFileSync(
+    `${wfDir}/.aih/workflows/bomb.mjs`,
+    `throw new Error("BOOM — workflow list must not import me");`,
+  );
+  writeFileSync(
+    `${wfDir}/.aih/workflows/sneaky.mjs`,
+    `globalThis.__WF_LIST_EXECUTED__ = "yes";
+     export default { name: "sneaky", phases: [{ name: "p", prompt: "x" }] };`,
+  );
+  const listNoExec = wfRun(["workflow", "list"]);
+  assert(
+    listNoExec.status === 0 && listNoExec.stdout.includes("bomb") && listNoExec.stdout.includes("sneaky"),
+    "workflow list cleanly lists an import-throwing module (no implicit execution)",
+  );
+  const runNoExec = wfRun(["workflow", "run", "bomb", "--mock", "--ephemeral"]);
+  assert(runNoExec.status === 1 && /BOOM/.test(runNoExec.stderr), "workflow run of an import-throwing module surfaces the import error");
 
   const runOk = wfRun(["workflow", "run", "good", "--mock", "--ephemeral"]);
   assert(runOk.status === 0 && runOk.stdout.includes("workflow ok") && runOk.stdout.includes("p2"), "workflow run (mock) passes both phases");

@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { ToolDefinition, ToolSchema } from "@aih/core";
+import { buildChildEnv } from "./env-policy.js";
 
 export const VERSION = "0.1.0";
 
@@ -85,9 +86,9 @@ export async function connectBackend(
     command,
     args,
     stderr: opts.quiet ? "pipe" : "inherit",
-    env: Object.fromEntries(
-      Object.entries(process.env).filter((pair): pair is [string, string] => pair[1] !== undefined),
-    ),
+    env: buildChildEnv(), // S3 P2 — sanitize (drop KEY/SECRET/TOKEN/PASSPHRASE
+    // and AIH_*API*), same policy as run_cmd children. MCP servers are
+    // third-party processes; they never need aih's own credentials.
   });
   const client = new Client({ name: "aih-cli", version: VERSION });
   await client.connect(transport);

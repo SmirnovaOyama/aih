@@ -126,7 +126,13 @@ export function listWorkflows(cwd: string): WorkflowInfo[] {
     }));
 }
 
-/** Fill in description/phase count by importing each workflow (best-effort). */
+/** Fill in description/phase count by importing each workflow (best-effort).
+ *
+ * NOTE (S1 P1): this EXECUTES every workflow module (dynamic import) just to
+ * read its description — never call it from a read-only path like `list`.
+ * It exists only for tooling that explicitly accepts executing the modules
+ * (currently unused; kept for run-time metadata tooling that opts in).
+ */
 export async function describeWorkflows(cwd: string): Promise<WorkflowInfo[]> {
   const infos = listWorkflows(cwd);
   await Promise.all(

@@ -208,7 +208,7 @@ import {
   T_TASK_TEMPLATE,
 } from "./templates.js";
 import {
-  describeWorkflows,
+  listWorkflows,
   loadWorkflow,
   runWorkflow,
 } from "./workflow.js";
@@ -1828,7 +1828,13 @@ async function cmdWorkflow(
 ): Promise<void> {
   const sub = positionals.shift() ?? "list";
   if (sub === "list") {
-    const infos = await describeWorkflows(process.cwd());
+    // Pure listing — do NOT import the workflow modules to read their
+    // description/phases. Importing executes arbitrary `.aih/workflows/*.mjs`
+    // (S1 P1: `aih workflow list` was running project code with zero
+    // confirmation). Listing shows only the filename; the real description
+    // surfaces on `run` (where executing the module is the whole point, and
+    // the user explicitly asked for that workflow by name).
+    const infos = listWorkflows(process.cwd());
     const format = str(flags, "format") ?? "text";
     if (format === "json") {
       console.log(JSON.stringify({ workflows: infos }, null, 2));
@@ -1841,9 +1847,7 @@ async function cmdWorkflow(
       return;
     }
     for (const info of infos) {
-      console.log(
-        `${bold(info.name)}  ·  ${info.phases} phase(s)${info.description ? `  ·  ${info.description}` : ""}`,
-      );
+      console.log(`${bold(info.name)}`);
     }
     return;
   }

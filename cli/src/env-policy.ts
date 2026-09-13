@@ -19,8 +19,8 @@ export interface EnvPolicyOptions {
 export function buildChildEnv(
   parent: NodeJS.ProcessEnv = process.env,
   opts: EnvPolicyOptions = {},
-): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
+): Record<string, string> {
+  const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(parent)) {
     if (value === undefined) continue;
     // Default excludes: name contains a secret hint (KEY, TOKEN, SECRET...).
