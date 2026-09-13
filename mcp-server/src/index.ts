@@ -37,6 +37,10 @@ export function buildServer(adapter: AppAdapter): McpServer {
   );
 
   for (const [name, def] of Object.entries(adapter.actions)) {
+    // Validate that parameters is a valid Zod object shape before registration
+    if (def.parameters && typeof def.parameters !== "object") {
+      throw new Error(`Action "${name}" has invalid parameters type: ${typeof def.parameters}`);
+    }
     server.registerTool(
       name,
       {

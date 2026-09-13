@@ -31,7 +31,8 @@ export const READONLY_CMD_PREFIXES: readonly string[] = [
 
 /** Substrings that make an otherwise read-only command potentially writes. */
 const DANGEROUS_SUBSTRINGS: ReadonlySet<string> = new Set([
-  ">", "<", "|", ";", "&", "`", "$(", "\n", "-delete", "-exec", "-execdir", "--exec", "sudo", "rm ", "mv ", "chmod", "chown", "tee ", "sh -c", "bash -c",
+  ">", "<", "|", ";", "&", "`", "$(", "\n", "-delete", "-exec", "-execdir", "--exec", "-s", "--set",
+  "sudo", "rm ", "mv ", "chmod", "chown", "tee ", "sh -c", "bash -c",
 ]);
 
 /**
@@ -47,7 +48,7 @@ export const READONLY_DEFENSIVE_BLACKLIST: readonly string[] = [
   ";", "&&", "||", "|", ">", "<", "&",
   "`", "$(", "${", "\\n",
   "sudo", "su ", "env ", "eval ", "exec ", "source ",
-  "--pre", "--exec", "-exec", "-execdir", "-delete",
+  "--pre", "--exec", "-exec", "-execdir", "-delete", "-ok", "-okdir",
   "-fprintf", "-fprint", "-fprint0", "-fls",
   "--pager", "--color=always", "--no-ignore",
   "sh -c", "bash -c", "zsh -c", "cmd /c",
