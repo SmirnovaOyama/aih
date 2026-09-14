@@ -584,8 +584,19 @@ function wireSafety(
 
 async function readPipedStdin(): Promise<string> {
   if (process.stdin.isTTY) return "";
+  // G12 fix: cap piped stdin so `cat huge-file | aih run` cannot grow memory
+  // linearly without bound. 10 MiB is far above any sane prompt payload.
+  const MAX_PIPED_STDIN = 10 * 1024 * 1024;
   const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  let total = 0;
+  for await (const chunk of process.stdin) {
+    const buf = chunk as Buffer;
+    total += buf.length;
+    if (total > MAX_PIPED_STDIN) {
+      throw new Error(`piped stdin exceeds the ${MAX_PIPED_STDIN} byte limit (${total} received)`);
+    }
+    chunks.push(buf);
+  }
   return Buffer.concat(chunks).toString("utf8").trim();
 }
 
@@ -1808,7 +1819,9 @@ async function cmdUpdate(positionals: string[], flags: Record<string, string | b
     console.error("error: non-interactive update requires --yes");
     process.exit(1);
   }
-  const staging = join(os.tmpdir(), `aih-update-${latestVersion.replace(/\./g, "-")}`);
+  // G11 fix: unique staging dir (PID+rand) so two concurrent updates of the
+  // same version cannot collide on the same staging path.
+  const staging = join(os.tmpdir(), `aih-update-${latestVersion.replace(/\./g, "-")}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
   process.stdout.write(`downloading aih-${latestVersion}-node.tar.gz → ${staging} …\n`);
   const { bytes } = await downloadTarball(latestVersion, staging);
   process.stdout.write(`downloaded ${(bytes / 1024 / 1024).toFixed(1)} MiB — applying…\n`);
@@ -2007,7 +2020,9 @@ async function handleUpdate(tui: Tui, arg: string, busy: boolean): Promise<void>
     );
     return;
   }
-  const staging = join(os.tmpdir(), `aih-update-${latestVersion.replace(/\./g, "-")}`);
+  // G11 fix: unique staging dir (PID+rand) so two concurrent updates of the
+  // same version cannot collide on the same staging path.
+  const staging = join(os.tmpdir(), `aih-update-${latestVersion.replace(/\./g, "-")}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
   try {
     tui.pushSystem(`downloading aih-${latestVersion}-node.tar.gz → ${staging} …`);
     const { bytes } = await downloadTarball(latestVersion, staging);

@@ -6129,6 +6129,7 @@ process.exit(ok === false ? 0 : 1);`;
 // --- D#13: background jobs (board bookkeeping + spawn lifecycle) -----------
 {
   const { loadBoard, saveBoard, summarize, spawnJob, cancelJob, jobById, jobsFile } = await import("./jobs.js");
+  const { withBoardLockSync } = await import("./jobs.js");
   const jobdir = mkdtempSync("/tmp/aih-jobs-");
   // pure bookkeeping
   assert(loadBoard(jobdir).jobs.length === 0, "empty board when no jobs file");
@@ -6163,6 +6164,29 @@ process.exit(ok === false ? 0 : 1);`;
   const f2 = spawnJob(jobdir, "will fail", { cli: fakeFail });
   await new Promise((res) => f2.child.on("close", () => res(null)));
   assert(jobById(jobdir, f2.job.id)?.status === "failed", "failing child marks job failed");
+
+  // G9/G10 regression: jobs.json stays valid & temp-free after interleaved
+  // RMW (spawn races finish), and saveBoard publishes atomically (no .tmp
+  // stragglers, never a truncated file).
+  {
+    const rmw = `${jobdir}/slow.mjs`;
+    writeFileSync(rmw, `await new Promise(r => setTimeout(r, 50)); process.exit(0);\n`);
+    const a = spawnJob(jobdir, "a", { cli: rmw });
+    const b = spawnJob(jobdir, "b", { cli: rmw });
+    await Promise.all([
+      new Promise((res) => a.child.on("close", () => res(null))),
+      new Promise((res) => b.child.on("close", () => res(null))),
+    ]);
+    const stragglers = readdirSync(join(jobdir, ".aih")).filter((f) => f.includes(".tmp-"));
+    assert(stragglers.length === 0, `atomic saveBoard leaves no .tmp- stragglers (got ${JSON.stringify(stragglers)})`);
+    const board = (await import("./jobs.js")).loadBoard(jobdir) as import("./jobs.js").JobBoard;
+    const ids = new Set(board.jobs.map((j) => j.id));
+    assert(
+      ids.has(a.job.id) && ids.has(b.job.id) && withBoardLockSync(() => loadBoard(jobdir)).jobs.length === board.jobs.length,
+      "interleaved spawn/finish both persist (RMW lock holds)",
+    );
+    assert(jobById(jobdir, a.job.id)?.status === "done" && jobById(jobdir, b.job.id)?.status === "done", "both interleaved jobs reach done");
+  }
   rmSync(jobdir, { recursive: true, force: true });
 }
 

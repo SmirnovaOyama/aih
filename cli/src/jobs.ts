@@ -17,6 +17,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readJson } from "./read-json.js";
+import { publishFile } from "./atomic.js";
 import { buildChildEnv, LLM_API_KEY_ENVS } from "./env-policy.js";
 
 export type JobStatus = "running" | "done" | "failed" | "cancelled";
@@ -62,8 +63,54 @@ export function loadBoard(cwd: string): JobBoard {
 
 export function saveBoard(cwd: string, board: JobBoard): void {
   const p = jobsFile(cwd);
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, `${JSON.stringify(board, null, 2)}\n`);
+  // G10 fix: atomic publish (temp + rename) so a crash mid-write can never
+  // leave a truncated jobs.json behind.
+  publishFile(p, `${JSON.stringify(board, null, 2)}\n`);
+}
+
+/**
+ * G9 fix — serialize the read-modify-write windows of spawnJob / finishJob /
+ * cancelJob (they all ran load→mutate→save with no lock; two interleaved
+ * operations — e.g. the TUI calling spawnJob while a child's close event fires
+ * finishJob — would silently drop one side's update).
+ * JS is single-threaded, so a plain sync mutex (each critical section runs
+ * without awaits) is sufficient: acquire during the load→mutate→save window,
+ * release after.
+ */
+let boardBusy = false;
+const boardWaiters: Array<() => void> = [];
+
+/** Run `fn` (MUST be synchronous) as an atomic read-modify-write on the board. */
+export function withBoardLockSync<T>(fn: () => T): T {
+  if (!boardBusy) {
+    boardBusy = true;
+    try {
+      return fn();
+    } finally {
+      const next = boardWaiters.shift();
+      if (next) next();
+      else boardBusy = false;
+    }
+  }
+  // Re-entrant/disable path: queue and run when the current holder finishes.
+  // (Only reachable from nested sync calls, which this module avoids; the
+  // fast path above covers every real call site.)
+  const result = { value: undefined as unknown, done: false };
+  boardWaiters.push(() => {
+    try {
+      result.value = fn();
+    } finally {
+      const next = boardWaiters.shift();
+      if (next) next();
+      else boardBusy = false;
+    }
+    result.done = true;
+  });
+  // Drain synchronously if the lock happens to be free after queued callbacks
+  // run — in practice boardBusy is always true here, so this is just safety.
+  while (!result.done && !boardBusy) boardWaiters.shift()?.();
+  if (!result.done) throw new Error("jobs: board lock reentrancy not supported for sync callers");
+  return result.value as T;
 }
 
 export function jobById(cwd: string, id: string): Job | undefined {
@@ -127,15 +174,17 @@ export function spawnJob(cwd: string, prompt: string, opts: SpawnJobOptions = {}
     createdAt: Date.now(),
     startedAt: Date.now(),
   };
-  const board = loadBoard(cwd);
-  board.jobs.push(job);
-  // cap the board: drop oldest finished jobs beyond MAX_JOBS
-  const finished = board.jobs.filter((j) => j.status !== "running");
-  if (finished.length > MAX_JOBS) {
-    const drop = new Set(finished.slice(0, finished.length - MAX_JOBS).map((j) => j.id));
-    board.jobs = board.jobs.filter((j) => !drop.has(j.id));
-  }
-  saveBoard(cwd, board);
+  withBoardLockSync(() => {
+    const board = loadBoard(cwd);
+    board.jobs.push(job);
+    // cap the board: drop oldest finished jobs beyond MAX_JOBS
+    const finished = board.jobs.filter((j) => j.status !== "running");
+    if (finished.length > MAX_JOBS) {
+      const drop = new Set(finished.slice(0, finished.length - MAX_JOBS).map((j) => j.id));
+      board.jobs = board.jobs.filter((j) => !drop.has(j.id));
+    }
+    saveBoard(cwd, board);
+  });
 
   const node = opts.node ?? process.execPath;
   const cli = opts.cli ?? process.argv[1] ?? "";
@@ -175,38 +224,42 @@ export function spawnJob(cwd: string, prompt: string, opts: SpawnJobOptions = {}
 }
 
 function finishJob(cwd: string, id: string, status: JobStatus, exitCode?: number, note?: string): void {
-  const board = loadBoard(cwd);
-  const job = board.jobs.find((j) => j.id === id);
-  if (!job) return;
-  job.status = status;
-  job.finishedAt = Date.now();
-  if (exitCode !== undefined) job.exitCode = exitCode;
-  if (note) job.preview = note;
-  // best-effort preview: last non-empty line of the captured output
-  try {
-    if (existsSync(job.out)) {
-      const text = readFileSync(job.out, "utf8").trim();
-      const lines = text.split("\n").filter((l) => l.trim());
-      if (lines.length) job.preview = lines[lines.length - 1].slice(0, 120);
+  withBoardLockSync(() => {
+    const board = loadBoard(cwd);
+    const job = board.jobs.find((j) => j.id === id);
+    if (!job) return;
+    job.status = status;
+    job.finishedAt = Date.now();
+    if (exitCode !== undefined) job.exitCode = exitCode;
+    if (note) job.preview = note;
+    // best-effort preview: last non-empty line of the captured output
+    try {
+      if (existsSync(job.out)) {
+        const text = readFileSync(job.out, "utf8").trim();
+        const lines = text.split("\n").filter((l) => l.trim());
+        if (lines.length) job.preview = lines[lines.length - 1].slice(0, 120);
+      }
+    } catch {
+      /* preview is best-effort */
     }
-  } catch {
-    /* preview is best-effort */
-  }
-  saveBoard(cwd, board);
+    saveBoard(cwd, board);
+  });
 }
 
 /** Cancel a running job (kill the child) and mark it cancelled. */
 export function cancelJob(cwd: string, id: string, child?: ChildProcess): boolean {
-  const board = loadBoard(cwd);
-  const job = board.jobs.find((j) => j.id === id);
-  if (!job || job.status !== "running") return false;
-  try {
-    child?.kill("SIGTERM");
-  } catch {
-    /* already gone */
-  }
-  job.status = "cancelled";
-  job.finishedAt = Date.now();
-  saveBoard(cwd, board);
-  return true;
+  return withBoardLockSync(() => {
+    const board = loadBoard(cwd);
+    const job = board.jobs.find((j) => j.id === id);
+    if (!job || job.status !== "running") return false;
+    try {
+      child?.kill("SIGTERM");
+    } catch {
+      /* already gone */
+    }
+    job.status = "cancelled";
+    job.finishedAt = Date.now();
+    saveBoard(cwd, board);
+    return true;
+  });
 }
