@@ -716,7 +716,7 @@ export class Tui {
   #probePromise: Promise<"narrow" | "wide"> | null = null;
   #frame = 0;
   #busySince = 0;
-  #arrowTimes: number[] = [];
+  #arrowTimes: { t: number; dir: -1 | 1 }[] = [];
   #sgrWheelSeen = false;
   #mouseHintShown = false;
   #swallowArrows = false;
@@ -2099,8 +2099,15 @@ constructor(opts: TuiOptions) {
    */
   #arrowKey(dir: -1 | 1): void {
     const now = Date.now();
-    this.#arrowTimes.push(now);
-    this.#arrowTimes = this.#arrowTimes.filter((t) => now - t <= 900);
+    // Track (time, direction) pairs. A real wheel-as-arrows burst is a stream
+    // of SAME-direction arrows at sub-80ms spacing (the terminal fires one
+    // flick's worth back-to-back); a human recalling history with ↑/↓ presses
+    // them slower (>80ms apart) and often mixes directions. Only the former
+    // must trip the wheel-loss detector — the old all-arrows-in-900ms count
+    // mis-fired on fast repetitive ↑ browsing, swallowing the user's real
+    // keys until the window expired.
+    this.#arrowTimes.push({ t: now, dir });
+    this.#arrowTimes = this.#arrowTimes.filter((e) => now - e.t <= 900);
     if (this.#arrowTimes.length === 1) {
       // Fresh burst window: the previous flick is over — pass arrows through
       // again and snapshot the composer so a burst inside THIS window can be
@@ -2108,7 +2115,8 @@ constructor(opts: TuiOptions) {
       this.#swallowArrows = false;
       this.#burstSnapshot = { edit: this.#edit, cursor: this.#cursor, hist: this.#histCursor };
     }
-    if (!this.#legacyWin && this.#sgrWheelSeen && this.#arrowTimes.length >= 3) {
+    const wheelLike = !this.#legacyWin && this.#sgrWheelSeen && this.#isWheelBurst(this.#arrowTimes);
+    if (wheelLike) {
       if (this.#burstSnapshot) {
         this.#edit = this.#burstSnapshot.edit;
         this.#cursor = this.#burstSnapshot.cursor;
@@ -2147,6 +2155,23 @@ constructor(opts: TuiOptions) {
       if (this.#histCursor >= this.#history.length) this.#histCursor = -1;
       this.#chooseHistory();
     }
+  }
+
+  /**
+   * A wheel-as-arrows burst: ≥3 SAME-direction arrow keys arriving back-to-back
+   * at sub-80ms spacing (a terminal/multiplexer that lost mouse tracking
+   * delivers a flick as a rapid arrow stream). A human pressing ↑ to browse
+   * input history keys slower and switches direction (↑ to go back, ↓ to go
+   * forward), so this never matches their rhythm — the old ≥3-in-900ms rule
+   * did, and the resulting swallow made fast history browsing feel stuck.
+   */
+  #isWheelBurst(events: { t: number; dir: -1 | 1 }[]): boolean {
+    if (events.length < 3) return false;
+    // Only the tail matters: the flick is the most recent rapid run.
+    const tail = events.slice(-3);
+    if (!tail.every((e) => e.dir === tail[0].dir)) return false; // same direction
+    const [a, b, c] = tail;
+    return c.t - b.t <= 80 && b.t - a.t <= 80; // back-to-back < 80ms each
   }
 
   #scrollBy(delta: number): void {

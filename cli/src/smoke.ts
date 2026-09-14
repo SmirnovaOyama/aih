@@ -5059,6 +5059,57 @@ process.exit(ok === false ? 0 : 1);`;
   assert(sysText.includes("mouse tracking"), "restored-tracking hint surfaced once");
 }
 
+// --- Regression: fast repeat ↑ history browsing must NOT trip the wheel
+//     swallow (real wheel-as-arrows is sub-80ms same-direction; a human
+//     pressing ↑ to browse history is slower and may alter direction) -------
+{
+  const { Tui } = await import("./tui.js");
+  const submitted: string[] = [];
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: (l: string) => submitted.push(l),
+  });
+  tui.seedHistory(["old-1", "old-2", "old-3", "old-4"]);
+  tui.feed("\x1b[<64;1;1M"); // one real SGR wheel event arms the detector
+  const t0 = Date.now();
+  // 5 fast ↑ presses, ~120ms apart (human rhythm, NOT sub-80ms) — must recall
+  // history entries one by one, NOT be swallowed as a wheel burst.
+  const fastUp = () => {
+    tui.feed("\x1b[A");
+  };
+  // feed × 5 with real delays mimicking a fast typist
+  const pressAt = [0, 120, 240, 360, 600]; // last gap 240ms > 80ms
+  for (const dt of pressAt) {
+    const wait = dt - (Date.now() - t0);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    fastUp();
+  }
+  const nowEdit = tui.editText();
+  assert(
+    nowEdit === "old-1",
+    `fast ↑ browsing recalls oldest history without wheel-swallow (got "${nowEdit}")`,
+  );
+  // The complaint: arrow burst detection swallowed subsequent ↑. Confirm the
+  // 5th press still landed (editText shows old-1 = 4 steps back), and no
+  // "mouse tracking" hint appeared for a human burst.
+  const sysText2 = tui.transcriptLines().map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
+  assert(
+    sysText2.split("mouse tracking").length - 1 === 0,
+    "human-rhythm ↑ burst did NOT surface the wheel-loss hint",
+  );
+  // And a ↓ press after browsing should still be honoured (not swallowed).
+  tui.feed("\x1b[B");
+  assert(
+    tui.editText() === "old-2",
+    `↓ after fast ↑ browse still moves forward in history (got "${tui.editText()}")`,
+  );
+}
+
 // --- Paint guard: rows never move the cursor or exceed the terminal ----------
 {
   // A row that reaches the terminal wider than #cols or carrying \n/\r makes
