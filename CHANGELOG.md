@@ -8,6 +8,16 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-09-14
+
+### Fixed
+- **TUI 输入历史浏览误触发滚轮恢复**（`cli/src/tui.ts`）：快速连按 ↑ 翻历史时，
+  "900ms 内 ≥3 箭头"的旧判定把*真实按键*误判为"鼠标跟踪丢失（滚轮转箭头）"，导致
+  输入框被回滚、后续 ↑ 被吞掉（`#swallowArrows`）直到 900ms 窗口过期——表现为
+  "只能按 ↓，拨一下才能继续翻历史"。修复：改为 `#isWheelBurst`——只有**最后 3 个
+  箭头同向且间隔 ≤80ms**（终端转发的滚轮流特征）才触发滚轮恢复；真人按键间隔
+  >80ms 或方向混合永不误触发。
+
 ## [0.8.6] - 2026-09-14
 
 ### Security
