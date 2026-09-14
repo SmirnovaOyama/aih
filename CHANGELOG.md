@@ -8,6 +8,17 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-09-14
+
+### Fixed
+- **`aih update` 在 Windows offline 安装上失败**（`EPERM: unlink node.exe`）：
+  offline 安装把便携 Node.js 放在 `app\.node\`，运行的 AIH 进程就是那个
+  node.exe；旧的"整目录 rename 交换"试图删除/重命名运行中的可执行文件，
+  Windows 拒绝（EPERM）。现在检测到 `app\.node\` 时走**复制覆盖**路径——
+  只把新 payload（aih、lib/、node_modules/、package.json）盖到旧目录，
+  **`.node\` 与正在运行的 node 完全不动**（旧 node 本就能继续用），不再触发
+  EPERM。普通 tarball 安装保持原子 rename 交换不变。
+
 ## [0.8.7] - 2026-09-14
 
 ### Fixed
