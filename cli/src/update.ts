@@ -366,6 +366,32 @@ export interface ApplyResult {
  * then swap: old → .bak, new → app. The old install is NEVER removed before
  * the new one is verified; on any failure the previous layout is restored.
  */
+/** True when the install ships a BUNDLED portable Node.js under app/.node
+ *  (Windows offline installs). The running AIH process IS that node.exe, so
+ *  the whole-app rename swap cannot work on Windows (an open executable
+ *  cannot be renamed/removed → EPERM unlink node.exe). Such installs update
+ *  by COPYING new files over the old app dir and leaving .node untouched. */
+function hasBundledNode(installDir: string): boolean {
+  return fs.existsSync(path.join(installDir, "app", ".node"));
+}
+
+/**
+ * Extract the staged tarball into a sibling dir, verify the launcher exists,
+ * then swap: old → .bak, new → app. The old install is NEVER removed before
+ * the new one is verified; on any failure the previous layout is restored.
+ *
+ * Two paths:
+ *  - plain tarball install (no bundled .node): atomic rename swap — old →
+ *    .bak, new → app (rename is atomic on the same filesystem), then the
+ *    backup is removed.
+ *  - Windows offline install (bundled .node): the running process IS
+ *    app/.node/.../node.exe, so renaming/removing app/ fails with EPERM on
+ *    Windows. Instead copy the NEW payload files (aih, lib/, node_modules/,
+ *    config/) OVER the old app dir, leaving .node fully untouched. Not
+ *    atomic, but never touches the running executable; on failure the old
+ *    files are already replaced only where the copy got far, so we keep the
+ *    staging dir for manual recovery instead of deleting it.
+ */
 export async function applyUpdate(
   tarball: string,
   version: string,
@@ -397,6 +423,21 @@ export async function applyUpdate(
   if (ver.code !== 0) {
     fs.rmSync(stage, { recursive: true, force: true });
     throw new Error(`new aih --version failed: ${ver.stderr.slice(0, 200)}`);
+  }
+
+  if (hasBundledNode(installDir)) {
+    // Windows offline: copy new payload over, keep .node (the running node.exe).
+    // Extract list same as the tarball layout: aih, lib/, node_modules/, package.json.
+    const payloadEntries = ["aih", "lib", "node_modules", "package.json"];
+    for (const name of payloadEntries) {
+      const src = path.join(stage, name);
+      const dst = path.join(appDir, name);
+      if (!fs.existsSync(src)) continue;
+      if (fs.existsSync(dst)) fs.rmSync(dst, { recursive: true, force: true });
+      fs.cpSync(src, dst, { recursive: true });
+    }
+    fs.rmSync(stage, { recursive: true, force: true });
+    return { installDir, backup: null };
   }
 
   // swap (rename is atomic on the same filesystem)

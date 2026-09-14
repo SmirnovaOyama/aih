@@ -755,6 +755,48 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     assert(u.detectInstallDir("/home/u/.local/share/aih/app/aih") === null, "detectInstallDir: missing layout → null");
     assert(u.detectInstallDir("/home/u/aih") === null, "detectInstallDir: not under app/ → null");
     assert(u.detectInstallDir("/home/u/bin/aih") === null, "detectInstallDir: bin/aih is not the app dir → null");
+    // Windows offline (bundled .node): update keeps .node untouched (the running
+    // node.exe cannot be renamed/removed on Windows → EPERM unlink node.exe).
+    // The copy-over path must replace payload files, never .node.
+    {
+      const root = mkdtempSync(join(tmpdir(), "aih-upd-node-"));
+      // existing install: <root>/app/aih (+ shebang launcher), .node/node.exe
+      const appDir = join(root, "app");
+      mkdirSync(join(appDir, ".node"), { recursive: true });
+      writeFileSync(join(appDir, ".node", "node.exe"), "OLD-NODE");
+      writeFileSync(join(appDir, "aih"), "#!/usr/bin/env node\n// old launcher\nconsole.log('0.8.6')");
+      // fake node_modules + lib so payload list covers them
+      mkdirSync(join(appDir, "lib", "cli"), { recursive: true });
+      writeFileSync(join(appDir, "lib", "cli", "index.js"), "old");
+      mkdirSync(join(appDir, "node_modules", "aih"), { recursive: true });
+      writeFileSync(join(appDir, "node_modules", "aih", "pkg.js"), "old");
+      // staged tarball: <root>/stage-content/aih + lib + node_modules + package.json
+      const stageContent = mkdtempSync(join(tmpdir(), "aih-upd-tarball-"));
+      writeFileSync(join(stageContent, "aih"), "#!/usr/bin/env node\n// new launcher\nconsole.log('0.8.7')");
+      mkdirSync(join(stageContent, "lib", "cli"), { recursive: true });
+      writeFileSync(join(stageContent, "lib", "cli", "index.js"), "new");
+      mkdirSync(join(stageContent, "node_modules", "aih"), { recursive: true });
+      writeFileSync(join(stageContent, "node_modules", "aih", "pkg.js"), "new");
+      writeFileSync(join(stageContent, "package.json"), "{}");
+      const tarball = join(root, "pkg.tar.gz");
+      // build a real .tar.gz from the staged content (applyUpdate runs `tar -xzf`)
+      const { spawnSync: tarSync } = await import("node:child_process");
+      const built = tarSync("tar", ["-czf", tarball, "-C", stageContent, "."], { encoding: "utf8" });
+      assert(built.status === 0, `update Windows-offline: tar build ok (${built.stderr})`);
+      // detectInstallDir: with .node present, still recognized as an install
+      // (update is SAFE — copy path avoids the running node.exe)
+      assert(u.detectInstallDir(join(appDir, "aih")) === root, "detectInstallDir: bundled-.node install still detected");
+      const res = await u.applyUpdate(tarball, "0.8.7", join(appDir, "aih"));
+      assert(res.installDir === root, "applyUpdate: Windows-offline installDir");
+      assert(readFileSync(join(appDir, "aih"), "utf8").includes("0.8.7"), "applyUpdate Windows-offline: launcher replaced");
+      assert(readFileSync(join(appDir, "lib", "cli", "index.js"), "utf8") === "new", "applyUpdate Windows-offline: lib replaced");
+      // THE core guarantee: .node is untouched (running node.exe survives)
+      assert(readFileSync(join(appDir, ".node", "node.exe"), "utf8") === "OLD-NODE", "applyUpdate Windows-offline: .node/node.exe untouched");
+      assert(process.platform !== "win32" ? existsSync(join(appDir, ".node", "node.exe")) : true, "applyUpdate: .node dir preserved");
+      rmSync(root, { recursive: true, force: true });
+      rmSync(stageContent, { recursive: true, force: true });
+      console.log("ok: self-update — Windows offline (.node) copy-over update keeps bundled node");
+    }
     console.log("ok: self-update — version compare, tarball naming, skip-state, install-dir detection");
   }
 
