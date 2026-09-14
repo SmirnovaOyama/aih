@@ -8,6 +8,29 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-09-14
+
+### Security
+- **MCP 参数校验加固**（`mcp-server/src/index.ts`，第五轮 F5 + 第六轮 G1）：注册前校验 action
+  parameters 为合法 Zod schema（粗校验 typeof + 鸭子类型 shapeOf：z.object 自动 unwrap、
+  非 Zod fail-fast）。
+- **Readonly 模式执行面加固**（`cli/src/readonly-allow.ts`，第五轮 F6/F7）：`date -s`/`--set`
+  与 `find -ok`/`-okdir` 加入危险子串/防御黑名单，阻断系统时间写入与交互式执行。
+- **环境变量脱敏扩充**（`cli/src/env-policy.ts`，第五轮 F8）：SECRET_HINT 正则加入
+  AUTH/CRED/ACCESS 模式。
+- **jobs.json 读-改-写竞态**（`cli/src/jobs.ts`，第六轮 G9）：spawn/finish/cancel 的
+  load→mutate→save 窗口加互斥锁（`withBoardLockSync`），交错调用不再丢更新。
+
+### Fixed
+- **MCP 工具调用超时**（`mcp-server/src/index.ts`，第六轮 G3）：per-call 120s 超时
+  （`AIH_MCP_TOOL_TIMEOUT_MS` 可覆盖），timer unref+clear 不拖住事件循环。
+- **MCP 错误序列化崩溃**（第六轮 G2）：textResult JSON replacer 处理 circular ref/bigint/function。
+- **jobs.json 非原子写**（第六轮 G10）：saveBoard 改 temp+rename 原子发布。
+- **更新暂存目录冲突**（`cli/src/index.ts`，第六轮 G11）：staging 目录加 PID+随机后缀。
+- **管道 stdin 无上限**（第六轮 G12）：`aih run <` 输入 10 MiB 上限，超限报错。
+- **@aih/core 依赖版本错位**（`cli/package.json`，第六轮 G15）：0.2.0 → 0.7.2
+  （修复 `npm ls` ELSPROBLEMS）。
+
 ## [0.8.5] - 2026-09-13
 
 ### Fixed
