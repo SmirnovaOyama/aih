@@ -751,10 +751,27 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     assert(u.readState().appliedVersion === "0.8.0", "markApplied never downgrades the version marker");
     rmSync(stateFile, { force: true });
     delete process.env.AIH_UPDATE_STATE_PATH;
-    // install-dir detection: only the tarball layout (<dir>/app/aih) qualifies
+    // install-dir detection: the entry may be the launcher (<dir>/app/aih) or
+    // ANY module running from inside it (<dir>/app/lib/cli/dist/index.js) —
+    // the bin wrapper execs the latter, so argv[1] sits several levels deep.
     assert(u.detectInstallDir("/home/u/.local/share/aih/app/aih") === null, "detectInstallDir: missing layout → null");
     assert(u.detectInstallDir("/home/u/aih") === null, "detectInstallDir: not under app/ → null");
     assert(u.detectInstallDir("/home/u/bin/aih") === null, "detectInstallDir: bin/aih is not the app dir → null");
+    // REGRESSION (0.8.8/0.8.9): a real install runs with
+    // argv[1]=<root>/app/lib/cli/dist/index.js — the OLD detector compared the
+    // entry's immediate parent against "app" and returned null, breaking
+    // `aih update` on every real install. Walk-up must find the app ancestor.
+    {
+      const root = mkdtempSync(join(tmpdir(), "aih-upd-detect-"));
+      const appDir = join(root, "app");
+      mkdirSync(appDir, { recursive: true });
+      writeFileSync(join(appDir, "aih"), "#!/usr/bin/env node\n// launcher\n");
+      assert(u.detectInstallDir(join(appDir, "aih")) === root, "detectInstallDir: launcher entry → install dir");
+      // argv[1] file does not need to exist on disk for the walk-up (it is
+      // just a pathname) — but the launcher must, so: deep entry works
+      assert(u.detectInstallDir(join(appDir, "lib", "cli", "dist", "index.js")) === root, "detectInstallDir: deep lib/cli/dist entry → install dir (bin-wrapper argv[1])");
+      rmSync(root, { recursive: true, force: true });
+    }
     // Windows offline (bundled .node): update keeps .node untouched (the running
     // node.exe cannot be renamed/removed on Windows → EPERM unlink node.exe).
     // The copy-over path must replace payload files, never .node.

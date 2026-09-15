@@ -253,27 +253,35 @@ function entryScript(): string {
 }
 
 export function detectInstallDir(execPath: string = entryScript()): string | null {
-  // tarball layout: <installDir>/app/aih (launcher) — the app dir must be named "app"
+  // The entry can be the launcher itself (<installDir>/app/aih) OR any module
+  // running from inside it (the bin wrapper execs
+  // <installDir>/app/lib/cli/dist/index.js — argv[1] sits several levels deep).
+  // Walk upward from the entry looking for an `app` ancestor, then verify that
+  // ancestor IS the app dir: it must contain the node-ESM launcher.
   if (!execPath) return null;
-  const appDir = path.dirname(execPath);
-  if (path.basename(appDir) !== "app") return null;
-  const installDir = path.resolve(path.dirname(appDir));
-  // The entry script must actually live INSIDE this install dir — otherwise
-  // we'd be running a dev checkout and "updating" would clobber the real
+  let dir = path.dirname(path.resolve(execPath));
+  let appDir: string | null = null;
+  for (let depth = 0; dir !== path.dirname(dir) && depth < 8; depth++) {
+    if (path.basename(dir) === "app") { appDir = dir; break; }
+    dir = path.dirname(dir);
+  }
+  if (!appDir) return null;
+  // The entry script must actually live INSIDE the app dir — otherwise we'd
+  // be running a dev checkout and "updating" would clobber the real
   // installed app in ~/.local/share/aih.
-  if (!path.resolve(execPath).startsWith(installDir + path.sep)) return null;
-  // Only the tarball layout (node ESM launcher) is auto-updatable. An OFFLINE
-  // install also has <dir>/app/aih, but it is a SHELL launcher (#!/bin/sh) that
+  if (!path.resolve(execPath).startsWith(appDir + path.sep)) return null;
+  // Only the node-ESM launcher layout is auto-updatable. An OFFLINE install
+  // also has <dir>/app/aih, but it is a SHELL launcher (#!/bin/sh) that
   // resolves a bundled/system node — overwriting it with the tarball's node
   // launcher breaks the shell wrapper's `exec node"$APP/aih"` (self-reference →
   // ERR_UNKNOWN_FILE_EXTENSION for the extensionless file), and the offline
   // install is meant to be updated by re-running the offline installer. Refuse
   // to auto-update a shell-launcher install; tell the user to reinstall offline.
-  const launcher = path.join(installDir, "app", "aih");
+  const launcher = path.join(appDir, "aih");
   if (!fs.existsSync(launcher)) return null;
   const head = fs.readFileSync(launcher, "utf8").slice(0, 64);
   if (!head.startsWith("#!/usr/bin/env node")) return null;
-  return installDir;
+  return path.resolve(path.dirname(appDir));
 }
 
 // ---- download + apply ----------------------------------------------------------
