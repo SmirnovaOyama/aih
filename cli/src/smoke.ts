@@ -797,6 +797,44 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
       rmSync(stageContent, { recursive: true, force: true });
       console.log("ok: self-update — Windows offline (.node) copy-over update keeps bundled node");
     }
+    // Q-R8 — tarball-swap update must NOT destroy non-payload app/ data. An
+    // OFFLINE install carries .node/ + .deployed-config.json inside app/;
+    // before the fix the swap replaced the whole dir and silently deleted
+    // them (the reported "update broke the install / config gone").
+    {
+      const { applyUpdate: applySwap } = await import("./update.js");
+      const root = mkdtempSync(join(tmpdir(), "aih-upd-swap-"));
+      const appDir = join(root, "app");
+      mkdirSync(join(appDir, "lib", "cli"), { recursive: true });
+      // offline-style payload + data the tarball does NOT ship
+      writeFileSync(join(appDir, "aih"), "#!/usr/bin/env node\nconsole.log('0.8.7')"); // node launcher (detect ok)
+      writeFileSync(join(appDir, "lib", "cli", "index.js"), "old");
+      writeFileSync(join(appDir, "package.json"), "{}");
+      mkdirSync(join(appDir, ".node", "bin"), { recursive: true });
+      writeFileSync(join(appDir, ".node", "bin", "node"), "OLD-NODE");
+      writeFileSync(join(appDir, ".deployed-config.json"), '{"marker":"deployed"}');
+      // fake new tarball (aih + lib + package.json, NO .node / .deployed-config)
+      const stageContent = join(root, "stage");
+      mkdirSync(join(stageContent, "lib", "cli"), { recursive: true });
+      writeFileSync(join(stageContent, "aih"), "#!/usr/bin/env node\nconsole.log('0.8.9')");
+      writeFileSync(join(stageContent, "lib", "cli", "index.js"), "new");
+      writeFileSync(join(stageContent, "package.json"), "{}");
+      const tarball = join(root, "pkg.tar.gz");
+      const { spawnSync: tarSync2 } = await import("node:child_process");
+      const built = tarSync2("tar", ["-czf", tarball, "-C", stageContent, "."], { encoding: "utf8" });
+      assert(built.status === 0, `update swap-preserve: tar build ok (${built.stderr})`);
+      const res = await applySwap(tarball, "0.8.9", join(appDir, "aih"));
+      assert(res.installDir === root, "update swap-preserve: installDir");
+      assert(readFileSync(join(appDir, "lib", "cli", "index.js"), "utf8") === "new", "update swap-preserve: new lib applied");
+      // THE regression: files inside app/ that the tarball doesn't ship survive the swap
+      assert(readFileSync(join(appDir, ".node", "bin", "node"), "utf8") === "OLD-NODE", "update swap-preserve: .node carried over (offline runtime survives)");
+      assert(readFileSync(join(appDir, ".deployed-config.json"), "utf8").includes("deployed"), "update swap-preserve: .deployed-config carried over");
+      assert(readFileSync(join(appDir, "aih"), "utf8").includes("0.8.9"), "update swap-preserve: launcher replaced");
+      assert(!existsSync(join(root, ".app-new-")) && readdirSync(root).every((n: string) => !n.startsWith(".app-")), "update swap-preserve: no staging/backup leftovers");
+      rmSync(root, { recursive: true, force: true });
+      rmSync(stageContent, { recursive: true, force: true });
+      console.log("ok: self-update — tarball-swap carries over non-payload app data (.node/.deployed-config), never destroys the offline install");
+    }
     console.log("ok: self-update — version compare, tarball naming, skip-state, install-dir detection");
   }
 
@@ -5056,6 +5094,50 @@ process.exit(ok === false ? 0 : 1);`;
     // caller (openPalette) dismisses the kept frame once the sub-flow ends
     pal.dismissTop();
     assert(!pal.overlayOpen(), "Q-R7: caller dismissTop() closes the kept palette");
+  }
+
+  // Q-R7b — connect-provider sub-flow parity (the reported dead-Enter bug):
+  // palette → "connect provider" must behave EXACTLY like "switch model" —
+  // child can be entered, Esc'd out of, and re-entered repeatedly; the kept
+  // palette frame is only dismissed on flow COMPLETION (dismissTop), never by
+  // the child's Esc-cancel (which must leave the frame for re-picking).
+  {
+    const { Tui } = await import("./tui.js");
+    const pal = new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: () => {},
+    });
+    const paletteP = pal.pick("Commands", [
+      { label: "switch model", hint: "change provider/model" },
+      { label: "connect provider", hint: "/connect" },
+    ], { keepOnSelect: true, reuse: true });
+    pal.feed("\x1b[B\r"); // down to "connect provider" + Enter (select)
+    const sel = (await Promise.race([
+      paletteP,
+      new Promise<{ kind: string }>((r) => setTimeout(() => r({ kind: "timeout" }), 400)),
+    ])) as { kind: string; index?: number };
+    assert(sel.kind === "select" && sel.index === 1, "Q-R7b: palette select 'connect provider'");
+    assert(pal.overlayOpen() && pal.isTop("Commands"), "Q-R7b: palette stays open after select");
+    // the connect sub-flow opens its child picker ON TOP (openConnectPicker)
+    const connectP = pal.pick("Connect provider", [{ label: "OpenAI" }, { label: "Other" }]);
+    assert(pal.overlayTitle()?.breadcrumb === "Commands", "Q-R7b: connect child on top, breadcrumb Commands");
+    // Esc in the connect child → back to the palette (kept), NOT dead
+    pal.feed("\x1b\x1b");
+    await new Promise((r) => setTimeout(r, 20));
+    assert((await connectP).kind === "cancel", "Q-R7b: connect child Esc cancels");
+    assert(pal.overlayOpen() && pal.isTop("Commands"), "Q-R7b: back at kept palette after connect Esc");
+    // ** the reported bug: SECOND Enter after Esc must re-enter a sub-flow **
+    pal.feed("\r"); // re-select the default row (index 0 = switch model)
+    await new Promise((r) => setTimeout(r, 20));
+    assert(pal.overlayOpen() && pal.isTop("Commands"), "Q-R7b: palette still usable after Esc→Enter re-entry");
+    // sub-flow COMPLETES (applyModel saved) → dismissTop pops the kept frame
+    pal.dismissTop();
+    assert(!pal.overlayOpen(), "Q-R7b: dismissTop after connect completion closes palette");
   }
 }
 

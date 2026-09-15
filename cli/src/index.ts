@@ -2350,7 +2350,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     type Command = { name: string; hint: string; run: () => void | Promise<void> };
     const commands: Command[] = [
       { name: "switch model", hint: "change provider/model", run: () => openModelPicker() },
-      { name: "connect provider", hint: "/connect — add/connect an API provider", run: () => handleLine("/connect") },
+      { name: "connect provider", hint: "/connect — add/connect an API provider", run: () => openConnectPicker() },
       { name: "mode build", hint: "full toolset (tab)", run: () => setMode("build") },
       { name: "mode plan", hint: "read-only planning (tab)", run: () => setMode("plan") },
       { name: "compact context", hint: "/compact — summarize earlier history", run: () => handleLine("/compact") },
@@ -2382,7 +2382,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     // palette resolves "cancel" → close. Previously Esc anywhere killed the
     // whole chain and the user had to Esc-out and re-open ctrl-p.
     for (;;) {
-      const outcome = await tui.pick("Commands", entries, { keepOnSelect: true });
+      const outcome = await tui.pick("Commands", entries, { keepOnSelect: true, reuse: true });
       if (outcome.kind !== "select") break; // Esc/ctrl-c on the palette itself
       await commands[outcome.index].run();
       if (!tui.isTop("Commands")) break; // sub-flow consumed the palette frame
@@ -2541,6 +2541,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
             `connected: ${id}/${model} — key ${persistedKey ? `stored in ${envFilePath()}` : `NOT set — set ${keyEnv}=<key>`}`,
             "auth",
           );
+          // Sub-flow finished → pop the kept palette frame (openPalette loop ends).
+          tui.dismissTop();
         } catch (err) {
           tui.pushError(err instanceof Error ? err.message : String(err));
         }
@@ -2596,6 +2598,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       tui.dismissTop();
     } catch (err) {
       tui.pushError(err instanceof Error ? err.message : String(err));
+      // Connection recorded regardless — end the sub-flow so the palette frame
+      // is popped (a hung frame would keep the keepOnSelect palette alive and
+      // the next Enter would re-trigger the flow).
+      tui.dismissTop();
     }
   }
 

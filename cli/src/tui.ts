@@ -1339,15 +1339,25 @@ constructor(opts: TuiOptions) {
   pick(
     title: string,
     entries: PickerEntry[],
-    opts?: { keepOnSelect?: boolean },
+    opts?: { keepOnSelect?: boolean; reuse?: boolean },
   ): Promise<PickerOutcome> {
     // Stack (opencode DialogProvider parity): a picker opened on top of an
     // existing one (palette → model picker) nests — the parent stays alive
     // underneath and Esc pops back to it.
     const parent = this.#ov();
+    // `reuse`: the palette loop keeps ONE frame on the stack and re-picks
+    // with it after each command/sub-flow instead of pushing a fresh frame.
+    // Without this, every iteration of openPalette's for(;;) pushed a new
+    // Commands frame — the stack grew one Commands frame per loop pass and a
+    // single Esc only peeled the top, leaving phantom frames alive (Enter
+    // after Esc was then eaten by the ghost frame: the reported "Esc, Esc,
+    // Enter dead" flow).
+    const existing =
+      opts?.reuse && parent && parent.title === title ? parent : undefined;
+    if (existing) this.#overlayStack.pop(); // reuse → replace in place, no growth
     this.#overlayStack.push({
       title,
-      ...(parent ? { breadcrumb: parent.title } : {}),
+      ...(parent && !existing ? { breadcrumb: parent.title } : {}),
       entries,
       filtered: entries.map((_, i) => i),
       query: "",
@@ -1370,6 +1380,11 @@ constructor(opts: TuiOptions) {
     // keepOnSelect: the frame stays for a sub-flow (child picker) to open on
     // top; the caller dismisses it with dismissTop() once that sub-flow ends.
     if (!(ov.keepOnSelect && outcome.kind === "select")) this.#overlayStack.pop();
+    // Reset escape state when leaving an overlay so the composer doesn't
+    // inherit a stale held-Esc that would swallow the next keystroke.
+    this.#held = "";
+    this.#escAt = 0;
+    this.#lastBareEscAt = 0;
     ov.resolve(outcome);
     this.requestPaint();
   }
@@ -1395,6 +1410,10 @@ constructor(opts: TuiOptions) {
     const ov = this.#ov();
     if (!ov) return;
     this.#overlayStack.pop();
+    // Reset escape state (see #closeOverlay) — composer must not inherit it.
+    this.#held = "";
+    this.#escAt = 0;
+    this.#lastBareEscAt = 0;
     ov.resolve({ kind: "cancel" });
     this.requestPaint();
   }
@@ -1431,23 +1450,58 @@ constructor(opts: TuiOptions) {
     }
   }
 
-  #overlaySeq(ch: string): void {
+  #overlaySeq(ch: string): boolean {
     if (ch === "\x1b") {
       const now = Date.now();
-      if (this.#held === "\x1b" && now - this.#escAt < 500) {
+      // Fast Esc-Esc (within the noise window) → cancel immediately.
+      if (this.#held === "\x1b" && now - this.#escAt < ESC_NOISE_MS) {
         this.#held = "";
+        this.#escAt = 0;
         this.#closeOverlay({ kind: "cancel" });
-        return;
+        return true;
+      }
+      // A stale held Esc (out of the window): abort and treat as fresh Esc.
+      if (this.#held === "\x1b") {
+        this.#held = "";
+        this.#escAt = 0;
       }
       this.#escAt = now;
       this.#held = "\x1b";
-      return;
+      // A LONE Esc closes the picker (the footer advertises Esc as the cancel
+      // affordance) — BUT a mouse/scroll event also starts with ESC, and its
+      // continuation bytes (ESC [ / ESC O / ESC < …) arrive in the SAME stdin
+      // read. Arm a timer: if no sequence-continuation byte consumes the held
+      // Esc within ESC_NOISE_MS, it was a real Esc → cancel. (opentui uses a
+      // 20ms disambiguation timeout; same principle at this codebase's
+      // noise-window constant.) A sequence burst never hits the timer.
+      const resolveEsc = () => {
+        if (this.#held === "\x1b" && this.#escAt > 0) {
+          this.#held = "";
+          this.#escAt = 0;
+          this.#closeOverlay({ kind: "cancel" });
+        }
+      };
+      const timer = setTimeout(resolveEsc, ESC_NOISE_MS);
+      // A pending Esc-cancel must never keep a headless process alive.
+      timer.unref?.();
+      return true;
     }
-    if (!this.#held) return;
-    if (this.#held === "\x1b" && (ch === "[" || ch === "O")) {
-      this.#held += ch;
+    if (!this.#held) return false;
+    if (this.#held === "\x1b" && (ch === "[" || ch === "O" || ch === "<")) {
+      // Sequence continuation — the held Esc was NOT a cancel gesture.
       this.#escAt = 0;
-      return;
+      this.#held += ch;
+      return true;
+    }
+    if (this.#held === "\x1b") {
+      // A non-sequence byte right after a bare Esc: the Esc WAS a real
+      // cancel gesture and this byte is REAL KEY INPUT (the common case:
+      // "Esc then Enter" fast enough to land in one stdin read — the exact
+      // reported flow "Esc out of switch-model → Enter does nothing").
+      // Cancel the layer the Esc refers to, clear the armed state, and
+      // REPLAY the byte through the normal overlay key handler.
+      this.#innermostCancel();
+      return false; // replay: caller routes ch to #overlayKey / composer
     }
     this.#held += ch;
     if (/[A-Za-z~]/.test(ch)) {
@@ -1470,7 +1524,23 @@ constructor(opts: TuiOptions) {
           break;
       }
     }
+    return true;
   }
+
+  /** Cancel the innermost overlay frame (pop + resolve "cancel") and reset
+   *  the escape machine — so a held-Esc cancelled because a NON-sequence
+   *  byte followed it still takes effect. */
+  #innermostCancel(): void {
+    const ov = this.#ov();
+    if (!ov) return;
+    this.#overlayStack.pop();
+    this.#held = "";
+    this.#escAt = 0;
+    this.#lastBareEscAt = 0;
+    ov.resolve({ kind: "cancel" });
+    this.requestPaint();
+  }
+
 
   /** Open the read-only help dialog (keybindings / states / commands). */
   openHelp(): void {
@@ -1577,6 +1647,14 @@ constructor(opts: TuiOptions) {
    *  mirrors how opencode/opentui deliver paste as one literal-text event to
    *  the editor widget. */
  #feed(data: string): void {
+    // AIH_TRACE_KEYS=1 — key-routing trace (TUI keybug debugging): every raw
+    // stdin chunk goes to stderr with byte-exact JSON, before any machine
+    // (paste/escape/overlay) consumes it. Off by default; zero cost when unset.
+    if (process.env.AIH_TRACE_KEYS === "1") {
+      process.stderr.write(`[chunk ${JSON.stringify(data)}]\n`);
+      const ovT = this.#ov();
+      process.stderr.write(`[state held=${JSON.stringify(this.#held)} escAt=${this.#escAt} ov=${ovT ? ovT.title + "|" + (ovT.breadcrumb ?? "") : "null"} stack=${this.#overlayStack.map((f) => f.title).join(">")}\n`);
+    }
     // The OSC 11 background-query answer (requested in start()) arrives on
     // stdin and must be consumed as data, never typed as keystrokes.
     const m = OSC11_BG.exec(data);
@@ -1671,7 +1749,18 @@ constructor(opts: TuiOptions) {
     }
     if (this.#ov()) {
       if (ch === "\x1b" || this.#held) {
-        this.#overlaySeq(ch);
+        // false = the byte is replayable input (bare-Esc cancelled the layer;
+        // the byte itself, e.g. Enter after Esc, must reach the key handler).
+        // The cancel may have popped the LAST overlay → re-route: still an
+        // overlay → #overlayKey; overlay gone → re-enter #char for normal
+        // composer/question routing (guards a null-ov crash on replay).
+        if (this.#overlaySeq(ch)) return;
+        if (this.#ov()) {
+          this.#overlayKey(ch);
+        } else {
+          this.#held = "";
+          this.#char(ch);
+        }
         return;
       }
       if (this.#inPaste) {
@@ -1690,7 +1779,8 @@ constructor(opts: TuiOptions) {
         // ordinary paste content — they leaked into the answer buffer AND
         // `#inPaste` stayed true forever, which swallowed Enter (became a
         // space) and Ctrl+C (ignored by #pasteChar) — a stuck prompt.
-        this.#escapeSeq(ch);
+        if (this.#escapeSeq(ch)) return;
+        this.#pasteChar(ch); // replay: bare-Esc cancelled, byte is paste text
         return;
       } else if (ch === "\x1b" || this.#held) {
         // Escape sequence (scroll keys, arrows, mouse) — do NOT swallow its
@@ -1706,8 +1796,7 @@ constructor(opts: TuiOptions) {
         // from "\x1b" to "" on a non-escape byte), fall through to the answer
         // handling below so that byte is processed as an answer key.
         const heldBefore = this.#held;
-        this.#escapeSeq(ch);
-        if (ch === "\x1b" || this.#held) return;
+        if (this.#escapeSeq(ch)) return;
         if (!(heldBefore === "\x1b")) return;
         // fall through: this byte belongs to the answer, not to a sequence
       }
@@ -1739,8 +1828,9 @@ constructor(opts: TuiOptions) {
       // sequences through #escapeSeq (handles scroll/click); only plain keys
       // reach the accept/refuse logic below.
       if (ch === "\x1b" || this.#held) {
-        this.#escapeSeq(ch);
-        return;
+        if (this.#escapeSeq(ch)) return;
+        // replay: bare-Esc consumed; the byte is a confirm answer key and
+        // MUST reach the accept/refuse matcher below (was swallowed).
       }
       if (!(this.#inPaste && (ch === "\x1b" || this.#held))) {
         const done = this.#confirm;
@@ -1781,8 +1871,9 @@ constructor(opts: TuiOptions) {
       }
     }
     if (ch === "\x1b" || this.#held) {
-      this.#escapeSeq(ch);
-      return;
+      // false = byte is replayable input (bare-Esc consumed; opentui
+      // parity: every byte produces an event, nothing is swallowed).
+      if (this.#escapeSeq(ch)) return;
     }
     switch (ch) {
       case "\r":
@@ -1875,7 +1966,7 @@ constructor(opts: TuiOptions) {
     }
   }
 
-  #escapeSeq(ch: string): void {
+  #escapeSeq(ch: string): boolean {
     if (ch === "\x1b") {
       const now = Date.now();
       if (this.#escAt > 0 && this.#held === "\x1b" && now - this.#escAt < 500) {
@@ -1889,7 +1980,7 @@ constructor(opts: TuiOptions) {
         if (now - this.#lastSeqAt >= ESC_NOISE_MS) {
           this.#doubleEsc();
         }
-        return;
+        return true;
       }
       this.#escAt = now;
       this.#held = "\x1b";
@@ -1916,7 +2007,22 @@ constructor(opts: TuiOptions) {
         // A pending Esc-deny must never keep a headless process alive.
         timer.unref?.();
       }
-      return;
+      // Generic lone-Esc flush (opentui stdin-parser parity: its 20ms
+      // DEFAULT_TIMEOUT_MS; the comment there notes Gemini/Claude use 50ms
+      // and Codex 20ms). If no sequence-continuation byte arrives within the
+      // window, the armed Esc is FINAL: clear it now instead of letting it
+      // sit pending until the next keystroke (which previously had to be
+      // replayed instead of plainly processed — and on pre-replay paths was
+      // swallowed outright).
+      const flushTimer = setTimeout(() => {
+        if (this.#held === "\x1b" && this.#escAt > 0) {
+          this.#held = "";
+          this.#escAt = 0;
+        }
+      }, ESC_NOISE_MS);
+      // A pending lone-Esc flush must never keep a headless process alive.
+      flushTimer.unref?.();
+      return true;
     }
     if (this.#held === "\x1b") {
       // '[' / 'O' start a CSI/SS3 sequence. ']' starts an OSC (operating-system
@@ -1930,13 +2036,13 @@ constructor(opts: TuiOptions) {
       if (ch === "[" || ch === "O" || ch === "<") {
         this.#escAt = 0;
         this.#held += ch;
-        return;
+        return true;
       }
       if (ch === "]" || ch === "P") {
         this.#escAt = 0;
         this.#lastBareEscAt = 0;
         this.#held = ch === "]" ? "osc:" : "dcs:";
-        return;
+        return true;
       }
       const now = Date.now();
       if (this.#lastBareEscAt > 0 && now - this.#lastBareEscAt < 500) {
@@ -1950,22 +2056,33 @@ constructor(opts: TuiOptions) {
         if (now - this.#lastSeqAt >= ESC_NOISE_MS) {
           this.#doubleEsc();
         }
+        return true;
       } else {
         this.#lastBareEscAt = now;
       }
+      // Non-sequence byte right after a bare Esc (opentui stdin-parser
+      // parity: every byte produces an event — nothing is swallowed). The
+      // Esc was a real gesture armed in #held; clear it and REPLAY the byte
+      // to the caller (composer key handling). Fixes "Esc then Enter does
+      // nothing" on the composer / question / confirm paths alike.
       this.#held = "";
+      this.#escAt = 0;
+      return false;
     } else if (this.#held === "osc:" || this.#held === "dcs:") {
       // OSC/DCS payload absorbed until terminator (BEL / ST ESC\ ).
       if (ch === "\x07") this.#held = ""; // BEL ends OSC
       else if (ch === "\x1b") this.#held = "\x1boscST"; // ESC begins ST; next '\' closes
       // else: keep absorbing payload
+      return true;
     } else if (this.#held === "\x1boscST") {
       // '\' completes ST (ESC \); anything else resets to absorbing the OSC.
       this.#held = ch === "\\" ? "" : ch === "\x07" ? "" : "osc:";
+      return true;
     } else {
       this.#held += ch;
       const final = /[A-Za-z~]/.test(ch);
       if (this.#held.length >= 2 && final) this.#escape(this.#held);
+      return true;
     }
   }
 

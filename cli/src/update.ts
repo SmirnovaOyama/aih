@@ -440,7 +440,16 @@ export async function applyUpdate(
     return { installDir, backup: null };
   }
 
-  // swap (rename is atomic on the same filesystem)
+  // swap (rename is atomic on the same filesystem), then RESTORE non-payload
+  // data that belongs to the install but is not shipped in the tarball:
+  // `.node/` (bundled portable node from the OFFLINE installer) and any other
+  // files/dirs living in app/ that the new payload does not carry. Observed
+  // bug: an offline install (shell launcher + $APP/.node) updated by `aih
+  // update` took the tarball-swap path, which REPLACED the whole app dir —
+  // .node vanished (launchers fell back to system node) and any data under
+  // app/ was silently destroyed. Config lives OUTSIDE app/ (cfg_dir), so no
+  // user config was touched here — but bundled-node installs must survive
+  // updates with the runtime they were installed with.
   fs.renameSync(appDir, backup);
   try {
     fs.renameSync(stage, appDir);
@@ -448,6 +457,16 @@ export async function applyUpdate(
     fs.renameSync(backup, appDir); // restore
     fs.rmSync(stage, { recursive: true, force: true });
     throw e instanceof Error ? e : new Error("swap failed");
+  }
+  // Carry over preserved assets (tracked in config/ and not provided by the new tarball) from the backup.
+  try {
+    for (const name of fs.readdirSync(backup)) {
+      if (name === "aih" || name === "lib" || name === "node_modules" || name === "package.json") continue;
+      if (fs.existsSync(path.join(appDir, name))) continue; // payload provides it
+      fs.cpSync(path.join(backup, name), path.join(appDir, name), { recursive: true });
+    }
+  } catch {
+    // best-effort: keep the update even if a data-carryover fails
   }
   fs.rmSync(backup, { recursive: true, force: true });
   return { installDir, backup: null };
