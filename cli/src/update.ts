@@ -272,6 +272,11 @@ function isAppAnchor(dir: string): boolean {
 
 export function detectInstallDir(execPath: string = entryScript()): InstallDirInfo | null {
   if (!execPath) return null;
+  // The bin launcher is a SYMLINK (~/.local/bin/aih → <installDir>/aih) and
+  // node does NOT resolve argv[1] — without realpath the entry looks like it
+  // lives outside any install. The entry is a file actually being executed,
+  // so realpath it first; a nonexistent path (test fixtures) walks as-is.
+  try { execPath = fs.realpathSync(execPath); } catch { /* keep as-is */ }
   // The entry script must actually live inside the app dir — otherwise we'd
   // be running a dev checkout and "updating" would clobber the real
   // installed app in ~/.local/share/aih.
