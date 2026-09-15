@@ -8,6 +8,28 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.9] - 2026-09-15
+
+### Fixed
+- **TUI 键盘：connect provider 二级菜单 Esc 后 Enter 死锁**（`cli/src/index.ts`）：
+  palette 里 "connect provider" 原来走 `handleLine("/connect")` → `void
+  openConnectPicker()`（不 await 子流），而 "switch model" 直接 await 其子流。
+  不 await 触发竞态：openPalette 的 `await run()` 立即返回、`isTop("Commands")`
+  为 true，循环 reuse 又压一个 Commands 帧（query 重置），随后 openConnectPicker
+  才异步 push Connect provider 帧——Esc 弹回后栈错乱，下一次 Enter 被路由到
+  陈旧的 resolve（屏幕看似停在 Commands，服务端 /connect 流程异步展开，表现为
+  "进入 provider 二级菜单再 Esc 后 Enter 无法再进入任务二级菜单"）。修复：
+  "connect provider" 改为直接 `run: () => openConnectPicker()`（与 switch model
+  同一 keepOnSelect 子流协议）；custom-provider 完成路径补 `dismissTop()`；
+  catalog-provider applyModel 失败也 `dismissTop()`（连接已保存则结束子流）。
+  回归：Q-R7b（7 断言）connect 子流 enter/esc/re-enter + 完成 dismiss；真实
+  非 mock PTY（AIH_TRACE_KEYS=1）双路径 enter→esc→re-enter 循环干净，无幽灵帧、
+  无 held 残留。
+- **`aih update` 升级后用户配置丢失**（`cli/src/update.ts`）：applyUpdate
+  rename-swap 后从 backup carry-over 回 tarball 未携带的 app/ 内资产
+  （`.node/`、`.deployed-config.json` 等）；offline 安装脚本只在 `config.json`
+  不存在时才部署 bundled config（从不覆盖已有）。
+
 ## [0.8.8] - 2026-09-14
 
 ### Fixed
