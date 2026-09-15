@@ -4300,6 +4300,46 @@ process.exit(ok === false ? 0 : 1);`;
 }
 
 {
+  // Single-Esc cancels a busy turn (opencode parity): the double-Esc
+  // requirement made interrupting a runaway turn need "many Esc presses".
+  // A lone Esc — no sequence continuation within ESC_NOISE_MS, and no
+  // overlay/confirm/question on top — is a deliberate gesture: cancel now.
+  const { Tui } = await import("./tui.js");
+  const lines: string[] = [];
+  let cancelled = 0;
+  let busy = false;
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => busy,
+    onLine: (l: string) => lines.push(l),
+    cancelTurn: () => { cancelled += 1; },
+  });
+  busy = true;
+  tui.feed("\x1b");
+  await new Promise((r) => setTimeout(r, 200)); // lone-Esc flush = ESC_NOISE_MS
+  assert(cancelled === 1, "single Esc cancels a busy turn");
+  // Not busy → the advertised "esc clear": composer reset, no cancel.
+  busy = false;
+  tui.feed("partial");
+  tui.feed("\x1b");
+  await new Promise((r) => setTimeout(r, 200));
+  assert(cancelled === 1, "idle Esc does not cancel");
+  // composer was cleared by the idle Esc ("esc clear") — feed only Esc, submit
+  tui.feed("\x1b[<something>"); // noise absorbed
+  // A mouse/scroll SGR burst right before Esc does not void the cancel
+  // (the burst consumes its ESC into a sequence; the NEXT lone Esc cancels).
+  busy = true;
+  tui.feed("\x1b<0;10;5M\x1b"); // SGR click burst, then a lone Esc
+  await new Promise((r) => setTimeout(r, 200));
+  assert(cancelled === 2, "lone Esc after a mouse burst still cancels");
+  console.log("ok: single Esc cancels a busy turn (idle Esc = clear) — opencode parity");
+}
+
+{
   // theme: OSC 11 background query resolves light/dark; response bytes must not
   // leak into the input
   const { Tui } = await import("./tui.js");

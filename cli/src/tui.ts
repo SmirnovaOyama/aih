@@ -195,7 +195,7 @@ const ESC_NOISE_MS = 150;
 // Kept short enough for the dialog width; each line is clipped anyway.
 const HELP_LINES: string[] = [
   bold("keys"),
-  "    enter send · esc clear · esc escape twice cancels the turn",
+  "    enter send · esc cancel turn (or clear) · esc esc also cancels",
   "    up/down recall history · Alt+Up recall queued · tab complete · ctrl-p palette",
   "    ? help (empty input) · mouse scroll/click · enter expand",
   bold("state"),
@@ -2068,6 +2068,17 @@ constructor(opts: TuiOptions) {
         if (this.#held === "\x1b" && this.#escAt > 0) {
           this.#held = "";
           this.#escAt = 0;
+          // A LONE Esc (no sequence continuation within the noise window) is a
+          // deliberate keystroke, not terminal noise. While a turn is busy it
+          // is the cancel gesture — requiring Esc-Esc made interrupting a
+          // runaway turn feel like "press Esc a dozen times" (the double-Esc
+          // gate also ate presses after a mouse/scroll burst bumped
+          // #lastSeqAt). No overlay/confirm/question on top: Esc there
+          // resolves locally first. Not busy → advertised "esc clear".
+          if (this.#opts.busy() && !this.#ov() && !this.#confirm && !this.#question) {
+            this.#doubleEsc(); // cancels the turn, clears the composer
+            return;
+          }
           // opencode question-parity: a lone Esc while a choice list is open
           // (and no sequence-continuation byte arrived in the noise window)
           // means the user wants to type their own answer — switch to
@@ -3495,7 +3506,7 @@ constructor(opts: TuiOptions) {
         ? "↑↓ select · enter confirm · number picks · esc = type your own"
         : "enter answer · esc cancel";
     }
-    else if (this.#opts.busy()) hint = "esc escape twice to cancel · enter queues";
+    else if (this.#opts.busy()) hint = "esc cancel turn · enter queues";
     else hint = "? help · /commands · ctrl-p palette · tab complete";
     // Scroll-back indicator (used to ride the now-removed dashed separator
     // row): shown on the hints row when scrolled up from the bottom.
