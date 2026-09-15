@@ -3765,6 +3765,104 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // opencode question-parity — options list interaction. A `question` tool
+  // call that carries concrete choices must render them as a selectable
+  // list: ↑↓ moves the highlight, Enter confirms, a digit picks directly,
+  // and Esc (or the trailing "other" row) switches to free-text. Regression
+  // guards: options used to be silently dropped at the TUI boundary (only
+  // the plain text appeared), and a bare Esc was swallowed by the escape
+  // machine, so Esc + typing stayed on the option layer and the typed
+  // answer was lost on Enter.
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const race = (p: Promise<string>) =>
+    Promise.race([p, new Promise((r) => setTimeout(() => r("TIMEOUT"), 400))]);
+  // 1) Enter on the default (first) option.
+  let p = tui.askQuestion("Which? ", ["A", "B", "C"]);
+  tui.feed("\r");
+  assert((await race(p)) === "A", "question options: Enter picks the first option");
+  // 2) ↓ then Enter → second option.
+  p = tui.askQuestion("Which? ", ["A", "B", "C"]);
+  tui.feed("\x1b[B\r");
+  assert((await race(p)) === "B", "question options: ↓ + Enter picks the second");
+  // 3) Digit key picks directly.
+  p = tui.askQuestion("Which? ", ["A", "B", "C"]);
+  tui.feed("3");
+  assert((await race(p)) === "C", "question options: digit key picks the option directly");
+  // 4) Bare Esc → free-text custom answer (Esc must reach the question, not
+  //    be swallowed by the escape machine).
+  p = tui.askQuestion("Which? ", ["A", "B"]);
+  tui.feed("\x1b");
+  await new Promise((r) => setTimeout(r, 40)); // let the noise-window elapse
+  tui.feed("custom answer");
+  tui.feed("\r");
+  assert((await race(p)) === "custom answer", "question options: Esc switches to free-text");
+  // 5) Trailing "other" row via ↓↓ then Enter → free-text.
+  p = tui.askQuestion("Which? ", ["A", "B"]);
+  tui.feed("\x1b[B\x1b[B\r");
+  await new Promise((r) => setTimeout(r, 40));
+  tui.feed("mine\r");
+  assert((await race(p)) === "mine", "question options: 'other' row reaches free-text");
+  // 6) No options → plain free-text input is unchanged.
+  p = tui.askQuestion("Say something");
+  tui.feed("hello\r");
+  assert((await race(p)) === "hello", "question options: no options → plain input");
+  // 7) Ctrl+C rejects the promise.
+  p = tui.askQuestion("Which? ", ["A"]);
+  const rejected = p.then(() => "resolved").catch(() => "rejected");
+  tui.feed("\x03");
+  assert((await race(rejected as Promise<string>)) === "rejected", "question options: Ctrl+C rejects");
+  // Renderer: the option rows must be visible above the input line.
+  const tui2 = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const q2 = tui2.askQuestion("Which? ", ["A", "B"]);
+  void q2;
+  const il = tui2.inputLayoutForTest(40); // renders options + input row
+  const ilText = il.lines.join("\n");
+  const hasOptions = /1\. A/.test(ilText) && /2\. B/.test(ilText) && /other \(type your own\)/.test(ilText);
+  assert(hasOptions, `question options: option rows rendered above the input (got "${ilText}")`);
+  // opencode gap=1 parity: the option rows are compact, a blank row separates
+  // the list from the "other" row, another blank row separates "other" from
+  // the answer input — and the input cursor row (ci) is the "❯" line. Also
+  // guard against a view-height regression: the box height reported by
+  // #inputLineCount must match the rendered row count, otherwise the fixed
+  // bottom padding/hints get pushed off-screen (unequal top/bottom padding).
+  const nOpts = 2;
+  assert(
+    il.lines[nOpts] === "" && il.lines[nOpts + 2] === "",
+    `question options: gap rows around "other" (options=${nOpts}, got ${JSON.stringify(il.lines.slice(0, nOpts + 3))})`,
+  );
+  assert(
+    il.lines[nOpts + 1].includes("other (type your own)"),
+    `question options: "other" row sits between the two gap rows (got ${JSON.stringify(il.lines[nOpts + 1])})`,
+  );
+  assert(
+    il.ci === il.lines.findIndex((l) => l.startsWith("❯")),
+    `question options: input cursor row is the ❯ line (ci=${il.ci}, lines=${JSON.stringify(il.lines)})`,
+  );
+  assert(
+    il.ci === nOpts + 3,
+    `question options: ci lands on the input row after the gaps (got ci=${il.ci}, expect ${nOpts + 3})`,
+  );
+  console.log("ok: question options (opencode parity) — ↑↓/Enter/digit/Esc/other/Ctrl-C/rendering");
+}
+
+{
   // Sticky scroll (pin-to-content): while a task streams new messages, the
   // user browsing history must NOT be yanked to the bottom. Scroll up →
   // unpinned; new pushes keep the viewport anchored; scroll to bottom / End

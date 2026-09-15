@@ -754,7 +754,19 @@ export class Tui {
   }[] = [];
   /** IT#5 — "confirm" = [y]/[n]/[a]; "runorcopy" = [R]un/[C]opy/[N]o. */
   #confirmMode: "confirm" | "runorcopy" | "grant" = "confirm";
-  #question: { resolve: (answer: string) => void; reject: (err: Error) => void } | null = null;
+  #question:
+    | {
+        resolve: (answer: string) => void;
+        reject: (err: Error) => void;
+        /** opencode question-parity: optional choice list rendered above the
+         *  input; ↑↓ select + Enter confirm (single-select immediate submit). */
+        options?: string[];
+        /** index into options for ↑↓ selection. */
+        sel: number;
+        /** true once the user opts into free-text (Other / custom answer). */
+        custom: boolean;
+      }
+    | null = null;
   #qbuf = "";
   #queue: string[] = [];
   #pendingExit = false;
@@ -1276,7 +1288,7 @@ constructor(opts: TuiOptions) {
     });
   }
 
-  askQuestion(question: string): Promise<string> {
+  askQuestion(question: string, options?: string[]): Promise<string> {
     // A text prompt cannot coexist with a modal overlay (the overlay would
     // swallow every keystroke) — e.g. the /connect flow asks for a base URL
     // right after the provider picker. Close the whole picker chain as
@@ -1289,7 +1301,16 @@ constructor(opts: TuiOptions) {
     this.#qbuf = "";
     this.requestPaint();
     return new Promise((resolve, reject) => {
-      this.#question = { resolve, reject };
+      // opencode question-parity: when the caller passes concrete choices,
+      // render them above the input and let the user ↑↓ + Enter (or type a
+      // number) to answer — a real option layer instead of an invisible list.
+      this.#question = {
+        resolve,
+        reject,
+        ...(options && options.length ? { options: [...options] } : {}),
+        sel: 0,
+        custom: false,
+      };
     });
   }
 
@@ -1802,11 +1823,40 @@ constructor(opts: TuiOptions) {
       }
       const done = this.#question;
       if (ch === "\r" || ch === "\n") {
+        // opencode question-parity: options present → Enter CONFIRMS the
+        // current selection (single-select submits immediately). Without
+        // options this is the free-text send, unchanged.
+        if (done.options && !done.custom) {
+          const opt = done.options[done.sel];
+          if (done.sel >= done.options.length) {
+            // "other" row → switch to free-text input for a custom answer.
+            this.#question = { ...done, custom: true };
+            this.requestPaint();
+            return;
+          }
+          if (opt !== undefined) {
+            this.#question = null;
+            this.#qbuf = "";
+            this.requestPaint();
+            done.resolve(opt);
+            return;
+          }
+        }
         this.#question = null;
         const answer = this.#qbuf;
         this.#qbuf = "";
         this.requestPaint();
         done.resolve(answer);
+      } else if (ch >= "1" && ch <= "9" && done.options && !done.custom) {
+        // Number keys select the n-th option directly (1-based).
+        const idx = ch.charCodeAt(0) - 49;
+        if (idx < done.options.length) {
+          const opt = done.options[idx];
+          this.#question = null;
+          this.#qbuf = "";
+          this.requestPaint();
+          done.resolve(opt);
+        }
       } else if (ch === "\x03") {
         this.#question = null;
         this.#qbuf = "";
@@ -2018,6 +2068,15 @@ constructor(opts: TuiOptions) {
         if (this.#held === "\x1b" && this.#escAt > 0) {
           this.#held = "";
           this.#escAt = 0;
+          // opencode question-parity: a lone Esc while a choice list is open
+          // (and no sequence-continuation byte arrived in the noise window)
+          // means the user wants to type their own answer — switch to
+          // free-text instead of leaving the list armed forever.
+          const q = this.#question;
+          if (q && q.options && !q.custom) {
+            this.#question = { ...q, custom: true };
+            this.requestPaint();
+          }
         }
       }, ESC_NOISE_MS);
       // A pending lone-Esc flush must never keep a headless process alive.
@@ -2067,6 +2126,17 @@ constructor(opts: TuiOptions) {
       // nothing" on the composer / question / confirm paths alike.
       this.#held = "";
       this.#escAt = 0;
+      // opencode question-parity: a bare Esc followed by a NON-sequence byte
+      // while a choice list is open means the user is typing their own
+      // answer (the list's "other" escape hatch) — switch to free-text and
+      // let this byte start it. Without this, Esc + typing stayed on the
+      // option layer and the typed text was silently dropped until Enter
+      // re-confirmed the highlighted option.
+      const q2 = this.#question;
+      if (q2 && q2.options && !q2.custom) {
+        this.#question = { ...q2, custom: true };
+        this.requestPaint();
+      }
       return false;
     } else if (this.#held === "osc:" || this.#held === "dcs:") {
       // OSC/DCS payload absorbed until terminator (BEL / ST ESC\ ).
@@ -2261,6 +2331,19 @@ constructor(opts: TuiOptions) {
       return;
     }
     if (this.#swallowArrows) return; // rest of the burst: not a real ↑/↓
+    // opencode question-parity: while a choice list is open, ↑↓ move the
+    // selected option (not the input history).
+    if (this.#question && this.#question.options && !this.#question.custom) {
+      const opts = this.#question.options;
+      // choices + trailing "other" row (free-text escape hatch) — wrap around
+      // both, so the last option's ↓ lands on "other" and its ↓ wraps to top.
+      const n = opts.length + 1;
+      if (n > 0) {
+        this.#question.sel = dir === -1 ? (this.#question.sel - 1 + n) % n : (this.#question.sel + 1) % n;
+        this.requestPaint();
+      }
+      return;
+    }
     if (dir === -1) {
       if (this.#history.length) {
         if (this.#histCursor < 0) this.#histCursor = this.#history.length - 1;
@@ -2453,7 +2536,16 @@ constructor(opts: TuiOptions) {
     if (this.#confirmText) return 1;
     if (this.#question) {
       const limit = Math.max(4, width - 6);
-      return Math.min(Tui.INPUT_MAX_ROWS, this.#wrapEdit(this.#qbuf, limit).length);
+      // opencode question-parity: a choice list renders its rows inside the
+      // input box, ABOVE the answer line. The box height must cover them
+      // (options + trailing "other" row + the answer line) or the fixed
+      // bottom rows (pad-above/box/hints/status) would overflow the screen
+      // and the box's bottom padding would be pushed out of view.
+      const q = this.#question;
+      // opencode parity: option rows + a gap before "other" + a gap before
+      // the input + the "other" row itself + the answer line.
+      const optRows = q.options && !q.custom ? q.options.length + 3 : 0;
+      return optRows + Math.min(Tui.INPUT_MAX_ROWS, this.#wrapEdit(this.#qbuf, limit).length);
     }
     const limit = Math.max(4, width - 6); // 2-space wrap indent fits inner (width-4)
     // opencode/mimo-code parity: the composer never grows past TEXTAREA_MAX_ROWS=6
@@ -3273,6 +3365,42 @@ constructor(opts: TuiOptions) {
       // cursor lands at the end of the answer (last wrapped line)
       const ci = Math.min(wrapped.length - 1, Tui.INPUT_MAX_ROWS - 1);
       const col = wrapped[ci]?.length ?? 0;
+      // opencode question-parity: choice list → render the options as rows
+      // above the input line (selected one highlighted, numbered so a digit
+      // key picks directly). An "Other" row gives an explicit escape hatch to
+      // free-text (Esc also works). No options → the plain input above.
+      if (this.#question?.options && !this.#question.custom) {
+        const opts = this.#question.options;
+        const sel = this.#question.sel;
+        // opencode question.tsx parity: its options list is a gap=1 container
+        // whose direct children are [question, options-list, other, input] —
+        // the OPTION rows themselves are packed tight inside one box, but a
+        // blank row separates the list from the "other" row and the input.
+        const optionRows: string[] = opts.map((opt, i) => {
+          const num = `${i + 1}.`;
+          const body = ` ${opt}`;
+          const row = `${dim(num)}${body}`;
+          return i === sel ? `${cyan("▸")} ${row}` : `  ${row}`;
+        });
+        // gap row between the option list and the "other" row (opencode's
+        // gap=1 between the options-list element and the other element).
+        optionRows.push("");
+        optionRows.push(
+          sel >= opts.length
+            ? `${cyan("▸")} ${dim("other (type your own)")}`
+            : `  ${dim("other (type your own)")}`,
+        );
+        // gap row between the "other" row and the answer input (opencode's
+        // gap=1 between the other element and the input/confirm element).
+        optionRows.push("");
+        const inputRow = wrapped.length === 1 ? `${cyan("❯")} ${this.#qbuf}` : lines[0];
+        return {
+          lines: [...optionRows, inputRow, ...(wrapped.length > 1 ? lines.slice(1) : [])],
+          segs: wrapped.slice(0, Tui.INPUT_MAX_ROWS),
+          ci: optionRows.length,
+          col,
+        };
+      }
       return { lines, segs: wrapped.slice(0, Tui.INPUT_MAX_ROWS), ci, col };
     }
     if (this.#confirmText) {
@@ -3360,7 +3488,13 @@ constructor(opts: TuiOptions) {
     // Contextual footer: only what is actionable right now (progressive disclosure).
     let hint: string;
     if (this.#confirmText) hint = this.#confirmMode === "runorcopy" ? "R run · C copy · N no" : "y once · a always · n deny";
-    else if (this.#question) hint = "enter answer · esc cancel";
+    else if (this.#question) {
+      // opencode question-parity: a choice list changes the footer guidance —
+      // ↑↓ picks, Enter confirms, a digit picks directly, Esc → free-text.
+      hint = this.#question.options && !this.#question.custom
+        ? "↑↓ select · enter confirm · number picks · esc = type your own"
+        : "enter answer · esc cancel";
+    }
     else if (this.#opts.busy()) hint = "esc escape twice to cancel · enter queues";
     else hint = "? help · /commands · ctrl-p palette · tab complete";
     // Scroll-back indicator (used to ride the now-removed dashed separator
