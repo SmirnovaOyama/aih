@@ -53,7 +53,7 @@ function wipeLocalSessions(): void {
   console.error(`[smoke] stashed pre-existing .aih/sessions → ${dest}`);
 }
 
-function assert(cond: boolean, msg: string): void {
+function assert(cond: unknown, msg: string): void {
   if (!cond) {
     console.error(`FAIL: ${msg}`);
     process.exit(1);
@@ -751,26 +751,43 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     assert(u.readState().appliedVersion === "0.8.0", "markApplied never downgrades the version marker");
     rmSync(stateFile, { force: true });
     delete process.env.AIH_UPDATE_STATE_PATH;
-    // install-dir detection: the entry may be the launcher (<dir>/app/aih) or
-    // ANY module running from inside it (<dir>/app/lib/cli/dist/index.js) —
-    // the bin wrapper execs the latter, so argv[1] sits several levels deep.
+    // install-dir detection: two updatable layouts — the tarball flat layout
+    // (<dir>/aih, what scripts/install deploys) and the offline app/ layout
+    // (<dir>/app/aih). The entry may be the launcher OR any module running
+    // from inside it (<dir>/app/lib/cli/dist/index.js — the bin wrapper
+    // execs the latter, so argv[1] sits several levels deep).
     assert(u.detectInstallDir("/home/u/.local/share/aih/app/aih") === null, "detectInstallDir: missing layout → null");
-    assert(u.detectInstallDir("/home/u/aih") === null, "detectInstallDir: not under app/ → null");
-    assert(u.detectInstallDir("/home/u/bin/aih") === null, "detectInstallDir: bin/aih is not the app dir → null");
+    assert(u.detectInstallDir("/home/u/aih") === null, "detectInstallDir: not under an install → null");
+    assert(u.detectInstallDir("/home/u/bin/aih") === null, "detectInstallDir: bin/aih is not an app dir → null");
     // REGRESSION (0.8.8/0.8.9): a real install runs with
     // argv[1]=<root>/app/lib/cli/dist/index.js — the OLD detector compared the
     // entry's immediate parent against "app" and returned null, breaking
-    // `aih update` on every real install. Walk-up must find the app ancestor.
+    // `aih update` on every real install.
     {
       const root = mkdtempSync(join(tmpdir(), "aih-upd-detect-"));
       const appDir = join(root, "app");
-      mkdirSync(appDir, { recursive: true });
+      mkdirSync(join(appDir, "lib", "cli", "dist"), { recursive: true });
       writeFileSync(join(appDir, "aih"), "#!/usr/bin/env node\n// launcher\n");
-      assert(u.detectInstallDir(join(appDir, "aih")) === root, "detectInstallDir: launcher entry → install dir");
-      // argv[1] file does not need to exist on disk for the walk-up (it is
-      // just a pathname) — but the launcher must, so: deep entry works
-      assert(u.detectInstallDir(join(appDir, "lib", "cli", "dist", "index.js")) === root, "detectInstallDir: deep lib/cli/dist entry → install dir (bin-wrapper argv[1])");
+      const launcherHit = u.detectInstallDir(join(appDir, "aih"));
+      assert(launcherHit && launcherHit.installDir === root && launcherHit.appDir === appDir, "detectInstallDir: offline app/ layout (launcher entry)");
+      const deepHit = u.detectInstallDir(join(appDir, "lib", "cli", "dist", "index.js"));
+      assert(deepHit && deepHit.installDir === root && deepHit.appDir === appDir, "detectInstallDir: deep lib/cli/dist entry → appDir (bin-wrapper argv[1])");
+      // flat tarball layout (scripts/install): <dir>/aih + lib/ directly
+      const flat = mkdtempSync(join(tmpdir(), "aih-upd-flat-"));
+      mkdirSync(join(flat, "lib", "cli", "dist"), { recursive: true });
+      writeFileSync(join(flat, "aih"), "#!/usr/bin/env node\n// launcher\n");
+      const flatHit = u.detectInstallDir(join(flat, "aih"));
+      assert(flatHit && flatHit.installDir === flat && flatHit.appDir === flat, "detectInstallDir: flat tarball layout → appDir == installDir");
+      const flatDeep = u.detectInstallDir(join(flat, "lib", "cli", "dist", "index.js"));
+      assert(flatHit && flatDeep && flatDeep.installDir === flat && flatDeep.appDir === flat, "detectInstallDir: flat layout deep entry → appDir == installDir");
+      // a shell launcher (offline .sh install) is NOT auto-updatable
+      const shell = mkdtempSync(join(tmpdir(), "aih-upd-shell-"));
+      mkdirSync(join(shell, "lib", "cli", "dist"), { recursive: true });
+      writeFileSync(join(shell, "aih"), "#!/bin/sh\nexec node \"$APP/aih\"\n");
+      assert(u.detectInstallDir(join(shell, "aih")) === null, "detectInstallDir: shell launcher → null (reinstall offline)");
       rmSync(root, { recursive: true, force: true });
+      rmSync(flat, { recursive: true, force: true });
+      rmSync(shell, { recursive: true, force: true });
     }
     // Windows offline (bundled .node): update keeps .node untouched (the running
     // node.exe cannot be renamed/removed on Windows → EPERM unlink node.exe).
@@ -783,15 +800,15 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
       writeFileSync(join(appDir, ".node", "node.exe"), "OLD-NODE");
       writeFileSync(join(appDir, "aih"), "#!/usr/bin/env node\n// old launcher\nconsole.log('0.8.6')");
       // fake node_modules + lib so payload list covers them
-      mkdirSync(join(appDir, "lib", "cli"), { recursive: true });
-      writeFileSync(join(appDir, "lib", "cli", "index.js"), "old");
+      mkdirSync(join(appDir, "lib", "cli", "dist"), { recursive: true });
+      writeFileSync(join(appDir, "lib", "cli", "dist", "index.js"), "old");
       mkdirSync(join(appDir, "node_modules", "aih"), { recursive: true });
       writeFileSync(join(appDir, "node_modules", "aih", "pkg.js"), "old");
       // staged tarball: <root>/stage-content/aih + lib + node_modules + package.json
       const stageContent = mkdtempSync(join(tmpdir(), "aih-upd-tarball-"));
       writeFileSync(join(stageContent, "aih"), "#!/usr/bin/env node\n// new launcher\nconsole.log('0.8.7')");
-      mkdirSync(join(stageContent, "lib", "cli"), { recursive: true });
-      writeFileSync(join(stageContent, "lib", "cli", "index.js"), "new");
+      mkdirSync(join(stageContent, "lib", "cli", "dist"), { recursive: true });
+      writeFileSync(join(stageContent, "lib", "cli", "dist", "index.js"), "new");
       mkdirSync(join(stageContent, "node_modules", "aih"), { recursive: true });
       writeFileSync(join(stageContent, "node_modules", "aih", "pkg.js"), "new");
       writeFileSync(join(stageContent, "package.json"), "{}");
@@ -801,12 +818,14 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
       const built = tarSync("tar", ["-czf", tarball, "-C", stageContent, "."], { encoding: "utf8" });
       assert(built.status === 0, `update Windows-offline: tar build ok (${built.stderr})`);
       // detectInstallDir: with .node present, still recognized as an install
-      // (update is SAFE — copy path avoids the running node.exe)
-      assert(u.detectInstallDir(join(appDir, "aih")) === root, "detectInstallDir: bundled-.node install still detected");
-      const res = await u.applyUpdate(tarball, "0.8.7", join(appDir, "aih"));
-      assert(res.installDir === root, "applyUpdate: Windows-offline installDir");
+      // (update is SAFE — copy path avoids the running node.exe). Entry = the
+      // real bin-wrapper argv[1] deep inside the app dir.
+      const nodeDetect = u.detectInstallDir(join(appDir, "lib", "cli", "dist", "index.js"));
+      assert(nodeDetect && nodeDetect.installDir === root && nodeDetect.appDir === appDir, "detectInstallDir: bundled-.node install still detected");
+      const res = await u.applyUpdate(tarball, "0.8.7", join(appDir, "lib", "cli", "dist", "index.js"));
+      assert(res.installDir === root && res.appDir === appDir, "applyUpdate: Windows-offline installDir");
       assert(readFileSync(join(appDir, "aih"), "utf8").includes("0.8.7"), "applyUpdate Windows-offline: launcher replaced");
-      assert(readFileSync(join(appDir, "lib", "cli", "index.js"), "utf8") === "new", "applyUpdate Windows-offline: lib replaced");
+      assert(readFileSync(join(appDir, "lib", "cli", "dist", "index.js"), "utf8") === "new", "applyUpdate Windows-offline: lib replaced");
       // THE core guarantee: .node is untouched (running node.exe survives)
       assert(readFileSync(join(appDir, ".node", "node.exe"), "utf8") === "OLD-NODE", "applyUpdate Windows-offline: .node/node.exe untouched");
       assert(process.platform !== "win32" ? existsSync(join(appDir, ".node", "node.exe")) : true, "applyUpdate: .node dir preserved");
@@ -822,27 +841,27 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
       const { applyUpdate: applySwap } = await import("./update.js");
       const root = mkdtempSync(join(tmpdir(), "aih-upd-swap-"));
       const appDir = join(root, "app");
-      mkdirSync(join(appDir, "lib", "cli"), { recursive: true });
+      mkdirSync(join(appDir, "lib", "cli", "dist"), { recursive: true });
       // offline-style payload + data the tarball does NOT ship
       writeFileSync(join(appDir, "aih"), "#!/usr/bin/env node\nconsole.log('0.8.7')"); // node launcher (detect ok)
-      writeFileSync(join(appDir, "lib", "cli", "index.js"), "old");
+      writeFileSync(join(appDir, "lib", "cli", "dist", "index.js"), "old");
       writeFileSync(join(appDir, "package.json"), "{}");
       mkdirSync(join(appDir, ".node", "bin"), { recursive: true });
       writeFileSync(join(appDir, ".node", "bin", "node"), "OLD-NODE");
       writeFileSync(join(appDir, ".deployed-config.json"), '{"marker":"deployed"}');
       // fake new tarball (aih + lib + package.json, NO .node / .deployed-config)
       const stageContent = join(root, "stage");
-      mkdirSync(join(stageContent, "lib", "cli"), { recursive: true });
+      mkdirSync(join(stageContent, "lib", "cli", "dist"), { recursive: true });
       writeFileSync(join(stageContent, "aih"), "#!/usr/bin/env node\nconsole.log('0.8.9')");
-      writeFileSync(join(stageContent, "lib", "cli", "index.js"), "new");
+      writeFileSync(join(stageContent, "lib", "cli", "dist", "index.js"), "new");
       writeFileSync(join(stageContent, "package.json"), "{}");
       const tarball = join(root, "pkg.tar.gz");
       const { spawnSync: tarSync2 } = await import("node:child_process");
       const built = tarSync2("tar", ["-czf", tarball, "-C", stageContent, "."], { encoding: "utf8" });
       assert(built.status === 0, `update swap-preserve: tar build ok (${built.stderr})`);
-      const res = await applySwap(tarball, "0.8.9", join(appDir, "aih"));
-      assert(res.installDir === root, "update swap-preserve: installDir");
-      assert(readFileSync(join(appDir, "lib", "cli", "index.js"), "utf8") === "new", "update swap-preserve: new lib applied");
+      const res = await applySwap(tarball, "0.8.9", join(appDir, "lib", "cli", "dist", "index.js"));
+      assert(res.installDir === root && res.appDir === appDir, "update swap-preserve: installDir");
+      assert(readFileSync(join(appDir, "lib", "cli", "dist", "index.js"), "utf8") === "new", "update swap-preserve: new lib applied");
       // THE regression: files inside app/ that the tarball doesn't ship survive the swap
       assert(readFileSync(join(appDir, ".node", "bin", "node"), "utf8") === "OLD-NODE", "update swap-preserve: .node carried over (offline runtime survives)");
       assert(readFileSync(join(appDir, ".deployed-config.json"), "utf8").includes("deployed"), "update swap-preserve: .deployed-config carried over");

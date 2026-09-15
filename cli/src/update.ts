@@ -240,48 +240,53 @@ export function markSkipped(version: string): void {
 // ---- install-dir detection ----------------------------------------------------
 
 /**
- * The tarball layout puts the app at <dir>/app with a launcher <dir>/app/aih.
- * A process running FROM that layout can be updated in place. Anything else
- * (repo checkout, npm -g, npx) returns null → caller shows the install command.
- */
-/**
- * The entry script (process.argv[1]) is the reliable signal — the launcher is
- * a SHELL script, so process.execPath is just the node binary.
+ * The entry can be the launcher itself or any module running from inside the
+ * app tree (the bin wrapper execs <appDir>/lib/cli/dist/index.js). Two layouts
+ * are updatable in place:
+ *  - tarball (scripts/package): <installDir>/aih + lib/ + node_modules/  (flat)
+ *  - offline: <installDir>/app/aih (node ESM launcher) + lib/ + node_modules/
+ * Walk upward from the entry looking for an anchor dir that contains BOTH the
+ * node-ESM `aih` launcher and lib/cli/dist, then verify the launcher shebang.
+ * Anything else (repo checkout, npm -g, npx, offline shell launcher) → null.
  */
 function entryScript(): string {
   return process.argv[1] ?? "";
 }
 
-export function detectInstallDir(execPath: string = entryScript()): string | null {
-  // The entry can be the launcher itself (<installDir>/app/aih) OR any module
-  // running from inside it (the bin wrapper execs
-  // <installDir>/app/lib/cli/dist/index.js — argv[1] sits several levels deep).
-  // Walk upward from the entry looking for an `app` ancestor, then verify that
-  // ancestor IS the app dir: it must contain the node-ESM launcher.
+export interface InstallDirInfo {
+  installDir: string;
+  appDir: string; // dir the update swaps in place (flat: == installDir)
+}
+
+
+/** Anchor check: dir contains the node-ESM aih launcher + the cli dist tree. */
+function isAppAnchor(dir: string): boolean {
+  const launcher = path.join(dir, "aih");
+  let st: fs.Stats;
+  try { st = fs.statSync(launcher); } catch { return false; }
+  if (!st.isFile()) return false;
+  const head = fs.readFileSync(launcher, "utf8").slice(0, 64);
+  if (!head.startsWith("#!/usr/bin/env node")) return false;
+  return fs.existsSync(path.join(dir, "lib", "cli", "dist"));
+}
+
+export function detectInstallDir(execPath: string = entryScript()): InstallDirInfo | null {
   if (!execPath) return null;
-  let dir = path.dirname(path.resolve(execPath));
-  let appDir: string | null = null;
-  for (let depth = 0; dir !== path.dirname(dir) && depth < 8; depth++) {
-    if (path.basename(dir) === "app") { appDir = dir; break; }
-    dir = path.dirname(dir);
-  }
-  if (!appDir) return null;
-  // The entry script must actually live INSIDE the app dir — otherwise we'd
+  // The entry script must actually live inside the app dir — otherwise we'd
   // be running a dev checkout and "updating" would clobber the real
   // installed app in ~/.local/share/aih.
-  if (!path.resolve(execPath).startsWith(appDir + path.sep)) return null;
-  // Only the node-ESM launcher layout is auto-updatable. An OFFLINE install
-  // also has <dir>/app/aih, but it is a SHELL launcher (#!/bin/sh) that
-  // resolves a bundled/system node — overwriting it with the tarball's node
-  // launcher breaks the shell wrapper's `exec node"$APP/aih"` (self-reference →
-  // ERR_UNKNOWN_FILE_EXTENSION for the extensionless file), and the offline
-  // install is meant to be updated by re-running the offline installer. Refuse
-  // to auto-update a shell-launcher install; tell the user to reinstall offline.
-  const launcher = path.join(appDir, "aih");
-  if (!fs.existsSync(launcher)) return null;
-  const head = fs.readFileSync(launcher, "utf8").slice(0, 64);
-  if (!head.startsWith("#!/usr/bin/env node")) return null;
-  return path.resolve(path.dirname(appDir));
+  let dir = path.dirname(path.resolve(execPath));
+  for (let depth = 0; dir !== path.dirname(dir) && depth < 8; dir = path.dirname(dir), depth++) {
+    if (!isAppAnchor(dir)) continue;
+    if (!path.resolve(execPath).startsWith(dir + path.sep)) continue;
+    // flat: installDir == appDir; offline: the anchor dir is literally `app`
+    // and the install dir is its parent (stage/backup/config live next to app/).
+    if (path.basename(dir) === "app") {
+      return { installDir: path.resolve(path.dirname(dir)), appDir: dir };
+    }
+    return { installDir: dir, appDir: dir };
+  }
+  return null;
 }
 
 // ---- download + apply ----------------------------------------------------------
@@ -366,6 +371,7 @@ async function expectedSha256(version: string): Promise<string | null> {
 
 export interface ApplyResult {
   installDir: string;
+  appDir: string; // dir that was swapped in place
   backup: string | null;
 }
 
@@ -379,8 +385,8 @@ export interface ApplyResult {
  *  the whole-app rename swap cannot work on Windows (an open executable
  *  cannot be renamed/removed → EPERM unlink node.exe). Such installs update
  *  by COPYING new files over the old app dir and leaving .node untouched. */
-function hasBundledNode(installDir: string): boolean {
-  return fs.existsSync(path.join(installDir, "app", ".node"));
+function hasBundledNode(appDir: string): boolean {
+  return fs.existsSync(path.join(appDir, ".node"));
 }
 
 /**
@@ -405,16 +411,18 @@ export async function applyUpdate(
   version: string,
   entry: string = entryScript(),
 ): Promise<ApplyResult> {
-  const installDir = detectInstallDir(entry);
-  if (!installDir) {
+  const detected = detectInstallDir(entry);
+  if (!detected) {
     throw new Error(
-      "not a tarball install (expected <dir>/app/aih) — install with: " +
+      "not an auto-updatable install (expected <dir>/aih or <dir>/app/aih with a node launcher) — install with: " +
         `curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/scripts/install | bash`,
     );
   }
-  const appDir = path.join(installDir, "app");
-  const stage = path.join(installDir, `.app-new-${Date.now()}`);
-  const backup = path.join(installDir, `.app-bak-${Date.now()}`);
+  const { installDir, appDir } = detected;
+  // Stage + backup as SIBLINGS of appDir (same filesystem → atomic rename;
+  // for the flat layout appDir == installDir, so they land next to the app).
+  const stage = path.join(path.dirname(appDir), `.app-new-${Date.now()}`);
+  const backup = path.join(path.dirname(appDir), `.app-bak-${Date.now()}`);
 
   fs.mkdirSync(stage, { recursive: true });
   const extract = await run("tar", ["-xzf", tarball, "-C", stage], DOWNLOAD_TIMEOUT_MS);
@@ -433,7 +441,7 @@ export async function applyUpdate(
     throw new Error(`new aih --version failed: ${ver.stderr.slice(0, 200)}`);
   }
 
-  if (hasBundledNode(installDir)) {
+  if (hasBundledNode(appDir)) {
     // Windows offline: copy new payload over, keep .node (the running node.exe).
     // Extract list same as the tarball layout: aih, lib/, node_modules/, package.json.
     const payloadEntries = ["aih", "lib", "node_modules", "package.json"];
@@ -445,7 +453,7 @@ export async function applyUpdate(
       fs.cpSync(src, dst, { recursive: true });
     }
     fs.rmSync(stage, { recursive: true, force: true });
-    return { installDir, backup: null };
+    return { installDir, appDir, backup: null };
   }
 
   // swap (rename is atomic on the same filesystem), then RESTORE non-payload
@@ -477,7 +485,7 @@ export async function applyUpdate(
     // best-effort: keep the update even if a data-carryover fails
   }
   fs.rmSync(backup, { recursive: true, force: true });
-  return { installDir, backup: null };
+  return { installDir, appDir, backup: null };
 }
 
 /** One-shot check for CLI `aih update --check`. */
