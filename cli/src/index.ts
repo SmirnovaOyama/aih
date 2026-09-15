@@ -820,14 +820,45 @@ export function loadEnvFile(env: NodeJS.ProcessEnv = process.env): void {
 }
 
 function fitBudget(text: string, budget: number): string {
-  if (text.length > budget) {
-    // OMP-R#7 + KL-R#2 — truncation carries an actionable marker so the model
-    // knows the memory was cut and how to retrieve the rest (edit the file or
-    // ask /memory for the live block), instead of silently believing the
-    // injected slice is the whole memory.
-    return `${text.slice(0, Math.max(budget - 64, 0))}\n…(memory truncated at budget — edit .aih/memory.md or use /memory to see the full block, then remember the key facts)`;
+  if (text.length <= budget) return text;
+  // OMP-R#7 + KL-R#2 — truncation carries an actionable marker so the model
+  // knows the memory was cut and how to retrieve the rest (edit the file or
+  // ask /memory for the live block), instead of silently believing the
+  // injected slice is the whole memory.
+  //
+  // Truncation strategy (head+tail, not head-only): memory.md is APPENDED to
+  // (remember action=append adds new dated entries at the END), so the newest
+  // facts — what the user just said — live at the tail. A head-only slice
+  // made the most recent memory permanently invisible past the budget: the
+  // model saw only the oldest few entries plus a "truncated at budget"
+  // marker, which is how "aih forgets what I told it" happened in practice
+  // (observed: 210KB / 206-entry memory.md injected as a 4KB head slice).
+  // Split the budget: keep the head (early conventions/background) AND the
+  // tail (latest entries), with an explicit gap marker between them. Cut on
+  // entry boundaries ("- " bullet lines) so no entry is chopped mid-line —
+  // except a single entry that alone exceeds its half: then keep the head of
+  // that entry (head) and the tail of that entry (tail) so nothing important
+  // is silently dropped whole.
+  const HEAD = Math.floor(budget * 0.6);
+  const TAIL = Math.max(budget - HEAD - 96, 0); // 96 ≈ gap-marker overhead
+  // Head: cut at the LAST entry boundary within HEAD chars.
+  let head = text.slice(0, HEAD);
+  const hCut = head.lastIndexOf("\n- ");
+  if (hCut > 0) head = head.slice(0, hCut);
+  if (!head.includes("- ")) head = text.slice(0, HEAD); // first entry alone > HEAD: keep its head
+  // Tail: cut at the FIRST entry boundary within the last TAIL chars.
+  const tailStart = Math.max(text.length - TAIL, 0);
+  let tail = text.slice(tailStart);
+  const tCut = tail.indexOf("\n- ");
+  if (tCut > 0) tail = tail.slice(tCut + 1); // keep the entry marker
+  if (!tail.includes("- ")) {
+    // Last entry alone > TAIL: keep the entry's HEAD (its "- date — summary"
+    // prefix is what identifies it) rather than a mid-entry tail slice.
+    const l = text.lastIndexOf("\n- ");
+    tail = l > 0 ? text.slice(l + 1, Math.min(text.length, l + 1 + TAIL)) : text.slice(tailStart);
   }
-  return text;
+  const marker = `\n\n…(memory truncated at budget — ${text.length} chars total; middle entries elided. Use memory_recall for older facts, or /memory to see the full block)\n\n`;
+  return `${head}${marker}${tail}`;
 }
 
 /**

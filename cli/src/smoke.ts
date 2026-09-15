@@ -2435,7 +2435,15 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
     process.env.AIH_MEMORY_BUDGET = "1200";
     try {
       const capped = loadMemoryBlock(workdir);
-      assert(capped.length <= 1400 && capped.includes("…(memory truncated at budget — edit .aih/memory.md or use /memory"), "AIH_MEMORY_BUDGET caps the injected memory block with an actionable truncation marker (OMP-R#7/KL-R#2)");
+      assert(capped.length <= 1400 && capped.includes("…(memory truncated at budget"), "AIH_MEMORY_BUDGET caps the injected memory block with an actionable truncation marker (OMP-R#7/KL-R#2)");
+      // Head+tail truncation: the TAIL of the memory (newest entries) must
+      // survive the cut — a head-only slice hid the most recent facts, which
+      // is how "aih forgets what I told it" presented in practice. Use real
+      // multi-entry memory: oldest entry at the top, newest at the bottom.
+      writeFileSync(`${workdir}/.aih/memory.md`, `# Project memory\n\n- 2026-01-01 — OLDEST_ENTRY_${"x".repeat(3000)}\n\n- 2026-09-15 — NEWEST_ENTRY_${"y".repeat(3000)}\n`);
+      const capped2 = loadMemoryBlock(workdir);
+      assert(capped2.includes("OLDEST_ENTRY"), "fitBudget keeps the head (oldest conventions) under budget");
+      assert(capped2.includes("NEWEST_ENTRY"), "fitBudget keeps the tail (newest entries) under budget — head-only slicing was the memory-loss bug");
     } finally {
       if (prevBudget === undefined) delete process.env.AIH_MEMORY_BUDGET;
       else process.env.AIH_MEMORY_BUDGET = prevBudget;
