@@ -3907,6 +3907,60 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // REGRESSION (0.8.10→): options must survive the WHOLE real chain —
+  // GeneralTools `question` execute → the wired `ask` callback (index.ts
+  // passes `(q, options)` into Tui.askQuestion) → TUI option rows rendered.
+  // Before the fix `index.ts` wired `ask: (q) => tui.askQuestion(q)`,
+  // silently DROPPING options — the TUI fell back to the plain free-text
+  // input and the choice list never appeared (the smoke above only called
+  // Tui.askQuestion directly, bypassing the callback, so it stayed green).
+  const { ToolRegistry, AutoApprove } = await import("@aih/core");
+  const { registerGeneralTools } = await import("./general-tools.js");
+  const { Tui: TuiReal } = await import("./tui.js");
+  const tui3 = new TuiReal({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const reg3 = new ToolRegistry(new AutoApprove());
+  registerGeneralTools(reg3, {
+    // EXACTLY the index.ts wiring shape: ask receives (q, options) and must
+    // forward BOTH — this is the assertion that used to fail.
+    ask: (q, options) => tui3.askQuestion(q, options),
+  });
+  // fire the invoke, then drive the TUI: the ask promise settles only when a
+  // key resolves it, so start it, inspect the rendered options, then pick.
+  const pending = reg3.invoke(
+    "question",
+    { question: "Pick?", options: ["red", "green"] },
+    { turnId: "t", inject: () => {} },
+  );
+  const il3 = tui3.inputLayoutForTest(40);
+  const ilText3 = il3.lines.join("\n");
+  assert(/1\. red/.test(ilText3) && /2\. green/.test(ilText3) && /other \(type your own\)/.test(ilText3),
+    `question via real chain: options rendered as rows (got "${ilText3.split("\n").slice(0, 6).join(" | ")}")`);
+  tui3.feed("2"); // digit pick → resolves askQuestion("green") → execute returns { answer: "green" }
+  const r3 = (await pending) as { ok: boolean; result?: { answer?: string } };
+  assert(r3.ok && r3.result?.answer === "green", `question via real chain: digit pick resolves through ask callback (got ${JSON.stringify(r3.result)})`);
+  // The REGRESSION was in the index.ts WIRING, not in GeneralTools/Tui: the
+  // entry file passed only `(q)` to the ask callback, dropping options before
+  // they ever reached Tui.askQuestion. Guard the wiring shape statically the
+  // same way the launcher templates are guarded — the real file must forward
+  // BOTH arguments (opencode parity: a single-arg `ask` form is the bug).
+  const indexSrc = readFileSync(join(process.cwd(), "cli", "src", "index.ts"), "utf8");
+  const wiringOk =
+    indexSrc.includes("ask: (q, options) =>") &&
+    indexSrc.includes("tuiRef.current.askQuestion(q, options)") &&
+    indexSrc.includes("makeStdinAsk(q, options)");
+  assert(wiringOk, "index.ts ask wiring forwards (q, options) — options are never dropped at the TUI boundary");
+  console.log("ok: question options via REAL chain — GeneralTools → ask callback → TUI rows + digit answer");
+}
+
+{
   // Sticky scroll (pin-to-content): while a task streams new messages, the
   // user browsing history must NOT be yanked to the bottom. Scroll up →
   // unpinned; new pushes keep the viewport anchored; scroll to bottom / End

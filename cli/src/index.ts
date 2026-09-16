@@ -1236,13 +1236,18 @@ export function withSkillRoster(
   return `${prompt}${header}${body}${warning}`;
 }
 
-function makeStdinAsk(question: string): Promise<string> {
+function makeStdinAsk(question: string, options?: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     if (!process.stdin.isTTY) {
       reject(new Error("the question tool needs an interactive terminal; run `aih chat`"));
       return;
     }
-    process.stderr.write(`❓ ${question}\n> `);
+    process.stderr.write(`❓ ${question}\n`);
+    if (options && options.length) {
+      options.forEach((opt, i) => process.stderr.write(`  ${i + 1}. ${opt}\n`));
+      process.stderr.write("  other (type your own)\n");
+    }
+    process.stderr.write("> ");
     const rl = createInterface({ input: process.stdin, output: process.stderr });
     rl.question("", (ans) => {
       rl.close();
@@ -1336,7 +1341,8 @@ export function registerLocalTools(
       // IT#1 — resolve the live session log at call time (created after the
       // registry in every path); absent → shell_context reports "not wired".
       logProvider: logRef ? () => logRef.current ?? undefined : undefined,
-      ask: (q) => (tuiRef.current ? tuiRef.current.askQuestion(q) : makeStdinAsk(q)),
+      ask: (q, options) =>
+        tuiRef.current ? tuiRef.current.askQuestion(q, options) : makeStdinAsk(q, options),
       // Textual-grant bridge: the `permissions` tool turns a plain-conversation
       // authorization ("直接写，不用确认") into a REAL allow rule (one human
       // confirm inside the grant). Only wired when the gate exposes the
