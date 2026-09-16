@@ -8,6 +8,19 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.11] - 2026-09-15
+
+### Fixed
+- **question options silently dropped at the TUI boundary** (`cli/src/index.ts`):
+  the agent wiring passed only `(q)` to the `ask` callback, so LLM-supplied
+  `options` never reached `Tui.askQuestion` and the choice list fell back to
+  the plain free-text input (the smoke suite exercised `Tui.askQuestion`
+  directly, bypassing the callback, so it stayed green). The wiring now
+  forwards `(q, options)` and the non-TTY stdin fallback renders the option
+  rows too. Regression: the full real chain (GeneralTools `question` execute →
+  `ask` callback → TUI option rows + digit pick answer) plus a static guard on
+  the wiring shape — fails on the pre-fix single-arg form.
+
 ## [0.8.10] - 2026-09-15
 
 ### Fixed
