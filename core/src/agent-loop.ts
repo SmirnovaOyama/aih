@@ -904,14 +904,27 @@ export class AgentLoop {
       // alone is NOT enough: a gateway's cumulative 949K read slips through a
       // 2×window gate once the window grows to 1M, then falsely trips the
       // 80% compaction trigger (949K ≥ 0.8×1M).
+      //
+      // Bidirectional band (same as cli/src/cost.ts lastContextTokens): reject
+      // the wire number when it is ≫ the local estimate (cumulative/garbage
+      // read) OR ≪ it (a stale/shrunk sample). The lower bound is the
+      // regression fix: a free-tier gateway (opencode zen) reported ~150K
+      // promptTokens on a conversation whose true size was ~213K — the old
+      // one-sided band admitted 150K (≤ est×3), so effectiveContext sat below
+      // the 160K trigger while the panel kept showing the real 213K, and
+      // compaction never fired mid-turn until the local estimate grew much
+      // larger. Using est as the floor (when plausible fails) keeps the
+      // compaction trigger honest with what deriveMessages would actually send.
       const est = this.#estimateContext();
       const plausible =
         promptTokens > 0 &&
         (this.#contextWindow <= 0 || promptTokens <= this.#contextWindow * 2) &&
-        promptTokens <= est * 3;
+        est >= 100 &&
+        promptTokens <= est * 3 && // report ≫ estimate → cumulative/garbage, distrust
+        est <= promptTokens * 1.25; // estimate ≫ report → stale/shrunk sample, distrust
       const effectiveContext = plausible
         ? promptTokens
-        : Math.max(contextNow, this.#estimateContext());
+        : Math.max(contextNow, est);
       if (plausible && promptTokens > contextTokens) contextTokens = promptTokens;
       contextNow = effectiveContext;
 

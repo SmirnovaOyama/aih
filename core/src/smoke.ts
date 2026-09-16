@@ -1472,6 +1472,66 @@ assert(
   );
 }
 
+// Shrunk/stale provider prompt_tokens must NOT starve compaction, even when
+// the wire number stays under the trigger. Regression: a free-tier gateway
+// (opencode zen) reported ~150K promptTokens on a conversation whose real
+// (locally estimated) size was ~190K — the old ONE-SIDED plausibility gate
+// (`promptTokens <= est*3`, no lower band) admitted 150K, pinning
+// effectiveContext below the 160K trigger (0.8×200K) while the TUI panel
+// showed the true ~190K, so auto-compaction never fired mid-turn until the
+// local estimate grew far past the window. The bidirectional band (est within
+// [promptTokens/3, promptTokens*1.25], same as cli/src/cost.ts
+// lastContextTokens) treats estimate ≫ report as distrust and falls back to
+// the local estimate for the compaction decision.
+{
+  const { AgentLoop: Loop } = await import("./agent-loop.js");
+  const sLog = new SessionLog();
+  const sTools = new ToolRegistry(gate);
+  sTools.register(echo);
+  // Pre-flight must NOT trigger: seed ~90k tokens (below 0.8×200k = 160k).
+  sLog.append({
+    type: "user/message",
+    turnId: "seed",
+    text: `seed question ${"s".repeat(315_000)}`,
+  });
+  // Response 1 carries a huge assistant text (~100k tokens — assistant text is
+  // never truncated, unlike tool results' 8K char cap) so the local estimate
+  // crosses the trigger AFTER the tool batch; the gateway reports a stale /
+  // shrunk 150K on BOTH responses.
+  const sScripted = new MockLLM([
+    {
+      text: "A".repeat(350_000),
+      toolCalls: [toolCall("s1", "echo", { text: "small" })],
+      stopReason: "tool_use",
+      usage: { promptTokens: 150_000, completionTokens: 10, totalTokens: 150_010 },
+    },
+    {
+      text: "done",
+      stopReason: "end_turn",
+      usage: { promptTokens: 150_000, completionTokens: 10, totalTokens: 150_010 },
+    },
+    { text: "SUMMARY of the earlier conversation" },
+  ]);
+  const sLoop = new Loop({
+    llm: sScripted,
+    tools: sTools,
+    log: sLog,
+    systemPrompt: "sys",
+    contextWindow: 200_000, // big-pickle window
+    compactAt: 0.8, // trigger = min(160k, 180k) = 160k
+  });
+  const sRes = await sLoop.send("hi");
+  assert(sRes.stopReason === "end_turn", "shrunk-promptTokens turn completes");
+  assert(
+    sLog.all().some((e) => e.type === "compaction"),
+    "shrunk promptTokens must not starve compaction: local estimate (~190k) ≥ trigger (160k) even though wire says 150k",
+  );
+  assert(
+    sRes.contextNow != null && sRes.contextNow < 160_000,
+    "post-compaction contextNow drops back under the window",
+  );
+}
+
 // Rolling compaction must tell the summarizer to drop finished work from
 // "Objective" — otherwise a stale Objective duplicates a Completed item and
 // the agent re-does finished work after compaction (observed: FB#5/#6 were
