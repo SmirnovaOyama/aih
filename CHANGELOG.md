@@ -8,6 +8,24 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.10] - 2026-09-15
+
+### Fixed
+- **Compaction starved by shrunk provider prompt_tokens** (`core/src/agent-loop.ts`):
+  a free-tier gateway (opencode zen) reported ~150K promptTokens on a
+  conversation whose real locally-estimated size was ~190K. The old one-sided
+  plausibility gate (`promptTokens <= est*3`, no lower bound) admitted 150K,
+  pinning `effectiveContext` below the 160K compaction trigger (0.8×200K
+  window) while the TUI panel showed the true ~190K — auto-compaction never
+  fired mid-turn until the local estimate grew far past the window. The wire
+  number is now trusted only while the local estimate stays within
+  `[promptTokens/3, promptTokens*1.25]` (bidirectional band, same as
+  `cli/src/cost.ts` `lastContextTokens`); estimate ≫ report (stale/shrunk
+  sample) falls back to the local estimate for the compaction decision.
+  Regression: seeded ~90K history → huge assistant text pushes the estimate
+  past the trigger while the gateway reports 150K on both responses →
+  compaction must fire (fails on pre-fix code).
+
 ## [0.8.9] - 2026-09-15
 
 ### Fixed
