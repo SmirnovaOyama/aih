@@ -1,11 +1,192 @@
 ---
 title: 更新日志
-description: AIH 版本更新日志 —— 0.5.0 / 0.4.0 / 0.3.0 / 0.2.0 / 0.1.0 的主要变更。
+description: AIH 版本更新日志 —— 0.8.x / 0.7.x / 0.6.x / 0.5.x 的主要变更。
 ---
 
 # 更新日志
 
 完整逐条记录见仓库 [`CHANGELOG.md`](https://github.com/summit4you/aih/blob/main/CHANGELOG.md)（Keep a Changelog 格式，SemVer 版本）。本页为各版本要点摘要。
+
+## 0.8.12（2026-09-17）
+
+**修复**
+
+- **opencode zen 免费层 403（session id 格式非法，安全/可用性）**：会话文件名为 `s-YYYYMMDD-HHMMSS`，此前直接透传进 `x-opencode-session` 头；opencode 网关校验 id **格式**（`ses_` + 26 位 base62），故每个请求都 403。`normalizeSid()` 现在把任何不合规 id 稳定重映射为合法 `ses_<26>`（同一会话 = 进程内稳定映射，跨请求不变）。
+- **最终步 steering 输入被吞**：模型即将结束回合时排队的 steering 会被静默丢弃；final-step drain 现在把挂起的 steering 追加进日志并多跑一步。
+- **压缩失败曾是静默 no-op**：空摘要让上下文继续膨胀且无诊断；现在输出带 `turn=` / `trigger=auto` 上下文的 stderr 行，摘要模板还逐字保留用户授权状态。
+
+**变更**
+
+- **模型选择器 MRU**：最近用过的 provider/模型浮到 `/model` 选择器顶部（去重，其余保持配置序）。
+- **Steering 召回（Alt+Up）**：把最近一条未消费的 steering 拉回编辑器重发；Ctrl+R 副键回退；question UX 钉底 + 滚动 + 可退出的自由输入模式。
+- **打包剥离 opencode 客户端身份头**：打包默认配置不再携带 opencode.ai provider 的 `x-opencode-session` / `x-opencode-client` / `x-opencode-project` / `x-opencode-request` / user-agent——AIH 不代发 opencode 官方客户端身份头。免费模型列表保留；如需 zen 免费层请自己在 aih.json 配头。
+
+## 0.8.11（2026-09-15）
+
+**修复**
+
+- **question options 在 TUI 边界被静默丢弃**：agent 接线只给 `ask` 回调传了 `(q)`，LLM 提供的 `options` 到不了 `Tui.askQuestion`，选项列表退化回纯自由文本输入（冒烟套件直接调 `Tui.askQuestion` 绕过了回调，所以保持绿色）。接线现转发 `(q, options)`，非 TTY stdin 回退也渲染选项行。
+
+## 0.8.10（2026-09-15）
+
+**修复**
+
+- **压缩被缩水的 provider prompt_tokens 饿死**：模型切换后 provider 上报的 token 计数缩水，旧判据误判"上下文不紧张"而跳过压缩；`agent-loop.ts` 改用本地估算交叉校验，压缩不再被错误跳过。
+
+## 0.8.9（2026-09-15）
+
+**修复**
+
+- **TUI 键盘：connect provider 二级菜单 Esc 后 Enter 死锁**：一级菜单 Esc 后焦点状态与 Enter 默认动作错位，导致按 Enter 卡死；状态重置修复。
+- **`aih update` 升级后用户配置丢失**：`applyUpdate` 合并配置时只认新包配置，覆盖了用户层配置；改为保留用户配置层。
+
+## 0.8.8（2026-09-14）
+
+**修复**
+
+- **`aih update` 在 Windows offline 安装上失败（`EPERM: unlink node.exe`）**：offline 安装部署便携 Node.js（`app\.node\...\node.exe`），运行的 AIH 进程就是该 exe；旧的整体改名交换（app → .bak、new → app）试图删除/改名**正在运行**的可执行文件——Windows 禁止，故应用更新中止。检测到 `app\.node\` 时 `applyUpdate` 走**copy-over** 路径：把新负载（aih、lib/、node_modules/、package.json）复制覆盖旧 app 目录，`.node\` 完全不动，不再重命名正在运行的 exe。普通 tarball 安装保持原原子改名交换。
+
+## 0.8.7（2026-09-14）
+
+**修复**
+
+- **TUI 输入历史浏览误触发滚轮恢复**：快速连按 ↑ 翻历史时视图被误判为滚动浏览而顶回底部；区分"输入历史浏览"与"任务输出滚动"的 pinned 状态修复。
+
+## 0.8.6（2026-09-14）
+
+**安全**
+
+- **MCP 参数校验加固**：注册前校验 action 参数 schema，非法参数拒绝注册。
+- **Readonly 模式执行面加固**：屏蔽 `date -s`/`--set` 等可写旗标，只读 shell 不可被绕过执行写操作。
+- **环境变量脱敏扩充**：SECRET_HINT 正则加入更多密钥形态，防止泄漏。
+- **jobs.json 读-改-写竞态**：spawn/finish/cancel 并发时任务板状态丢失；改为原子更新。
+
+**修复**
+
+- **MCP 工具调用超时**：per-call 120s 超时，防挂死。
+- **MCP 错误序列化崩溃**：textResult JSON replacer 处理 circular ref/bigint/function。
+- **jobs.json 非原子写**：saveBoard 改 temp+rename 原子发布。
+- **更新暂存目录冲突**：staging 目录加 PID+随机后缀，防并发冲突。
+- **管道 stdin 无上限**：`aih run <` 输入 10 MiB 上限，超限报错。
+- **@aih/core 依赖版本错位**：cli 依赖 core 0.2.0 → 0.7.2 修正。
+
+## 0.8.5（2026-09-13）
+
+**修复**
+
+- **后台 agent 环境变量泄漏（安全）**：jobs/teams 后台任务继承宿主完整环境，含密钥；改为构建受控环境。
+- **readonly-allow 漏 find 写旗标**：`find` 的 `-delete`/`-exec` 等写旗标未列入只读放行检查，补全。
+
+## 0.8.4（2026-09-13）
+
+**修复**
+
+- **发布供应链完整性（安全）**：打包/安装脚本加固，防发布物被篡改。
+- **offline 打包凭据泄漏（安全）**：合并配置时本地 provider 密钥混入打包产物；改为只带空配置。
+- **todo store 非原子写导致数据丢失**：`mcp-server/src/app-adapter.ts` 改 temp+rename 原子写。
+- **第三方 MCP 工具默认放行（安全）**：未声明权限的第三方工具改为默认 deny，避免静默放行。
+- **webfetch HTML 实体越界**：`&#(\d+);` 超过 Unicode 范围崩溃；钳制修复。
+- **smoke 凭据形状断言恒真修复**：断言形态修正，不再恒真。
+
+## 0.8.3（2026-09-13）
+
+**修复**
+
+- **`aih workflow list` 不再执行工作流代码（安全）**：列表命令误 import 工作流模块导致执行副作用；改为纯元数据读取。
+- **MCP server 子进程环境变量脱敏（凭据泄漏面）**：MCP 子进程继承父进程含密钥的环境；改为受控环境透传。
+
+## 0.8.2（2026-09-13）
+
+**修复**
+
+- **权限门路径穿越（安全，R3 P1）**：`RulesetGate.evaluate/explain` 对路径参数未做规范化，`..` 可绕过 deny 规则；补路径规范化与匹配。
+- **非 TTY ask 挂死（R3 P2）**：`SessionGate` 无 TUI 时 ask 回退到 readline，不再无限等待。
+- **并发 ask 槽位竞争（turn 悬挂，R5 P1）**：两个 `permission="ask"` 工具并发时 TUI 只渲染一个槽位，另一个永久悬挂；补并发队列。
+- **/model 切换瞬间上下文闪 6k（面板口径不一致）**：`applyModel` 换模型后上下文估算口径与面板不一致，闪一下 6k；统一口径。
+
+## 0.8.1（2026-09-10）
+
+**新增**
+
+- **自更新支持 GitHub 国内镜像（离线/GitHub 不可达时下载更新包）**：`cli/src/update.ts` 支持镜像源回退，国内用户可正常更新。
+- **同版本 release 重传检测**：`--clobber` 刷新 release 后也能触发更新（同版本 sha 变化视为新包）。
+
+**修复**
+
+- **TUI 输入后延迟数秒才出现消息与 loading 转圈**：session-log 写入阻塞 UI 渲染；异步化修复。
+- **Windows 上 `aih update` 解压失败**：`.bin\node-which` 解压路径非法；打包脚本修正。
+- **TUI 面板 todo 在压缩/全完成后消失**：压缩后保留 todo 面板状态。
+- **浏览历史时按 End 无法回到底部**：VT 终端序列 `ESC[4~` 未处理；补键位。
+- **任务执行中滚动浏览历史被新消息顶回底部**：缺 pinned 状态，`#follow()` 无条件钉底；补 pinned。
+- **26 字母中只有 `o`/`O` 在空输入框无法输入**：toggle 快捷键与字母冲突；空输入框时按键优先给文本。
+- **重启后首次输入 `o`/`O` 被吞**：DSR probe chunk 丢弃竞态；probe 响应不再吞首字符。
+
+## 0.8.0（2026-09-07）
+
+**新增**
+
+- **网络失败弹性（turn 级 park-and-retry）**：流中 `finish_reason: network_error` / 连接中断时 park 该 turn，后续重试不丢上下文。
+- **hook 故障隔离**：工具注册表与权限缝中的 hook 抛错不再拖垮主流程，单 hook 故障隔离。
+- **凭据存储边界净化**：`sanitizeCredential` 确保密钥只落在凭据槽，不入核心状态。
+- **技能可见性分层**：frontmatter `visibility:` 支持，技能可按可见性分级。
+- **edit 自动修复 + 受保护区**：edit 失败自动重试小步修改；受保护区（如凭据文件）不可 edit。
+- **prompt-cache 分桶统计**：按窗口分桶统计缓存命中，量化前缀稳定收益。
+- **可逆 secret 占位符**：secret 在工具输出中以可逆占位符隐藏，防泄漏且不破坏回放。
+- **只读 shell 防御性否决**：`readOnlyBash` 直接把写命令否决在权限缝。
+- **分支蒸馏**：checkRestoreSafety 防止分支切换覆盖未合并工作。
+- **Doom-loop 升级观测器 + 重复调用止损**：检测重复工具调用循环并升级为 escalate。
+
+## 0.7.2（2026-09-06）
+
+**新增**
+
+- **`read_file` 双预算 + 四态截断**：行数 + 字节双预算，截断保留头尾并打 elided 标记。
+- **compaction 文件改动清单（file manifest）**：压缩时记录本次会话改动的文件清单，压缩后保留上下文线索。
+- **只读 bash 护栏 + guarded 写工具**：只读模式细分"纯读"与"guarded 写"（有界写允许），path-scoped 兄弟工具断言对齐。
+
+**变更**
+
+- `core/src/smoke.ts`：path-scoped 兄弟写工具断言对齐 KL-R#4 guarded 语义。
+
+**修复**
+
+- **TUI 显示修复**（对齐 opencode / mimo-code）：Linux 光标、block-char 用量条、meta 行折叠等显示问题。
+
+## 0.7.1（2026-09-06）
+
+**变更**
+
+- **Windows/PowerShell TUI 显示修复**（对齐 opencode / mimo-coder）：conhost 下键盘展开、边距、ASCII 用量条、UTF-8 codepage 兼容。
+
+## 0.7.0（2026-09-06）
+
+**新增**
+
+- **流内 `finish_reason: network_error` 重试**（opencode v1.18.20 对齐）：网络错误不在中途丢弃响应，自动重试同 turn。
+- **prompt-cache 前缀稳定性**：系统提示新增前缀稳定性纪律段；易变内容后置，避免破坏缓存前缀。
+- **remember 超预算显式警告**：memory.md 写入超 `AIH_MEMORY_BUDGET` 时显式警告而非静默截断。
+- **upstream-review 技能 hard gate**：上游机制断言必须本机源码实读 + `file:line` 引用，失据降级为"未验证（线索）"。
+- **MCP add_todo 批量形式**：`items` 数组（1–50）一次调用新增多条，避免 re-planning。
+- **Windows 兼容（mimo-code 对齐）**：run_cmd/sandbox 在 win32 解析执行 shell，跨平台一致。
+- **冒烟 suite 挂起修复**：live tsserver 子进程 spawn 后从不关闭导致的挂起；补关闭。
+
+## 0.6.0（2026-09-05）
+
+**新增**
+
+- **MEA 独立判定层（LH#1 + CX-R#1 合并实施，roadmap 最高优先级项）**：Manager/Executor/Auditor 三角色循环 + verified-state ledger——executor 的行动由独立 auditor 校验后再入账，模型自述不算证据，从机制上避免"自跑自判"。
+- **Textual-grant bridge（`permissions` 工具）**：用户在对话里明确授权（"直接写"/"不用确认"）时，agent 通过 `permissions` 工具把它转成真实权限规则，对话授权不再只是一句空话。
+- **CL-R#3 拒绝双段消息（cline 同构）**：所有权限拒绝 error 统一追加 REJECTION_SUFFIX，模型不再误判拒绝为可重试。
+- **KL-R#3 子代理权限传播**：`RulesetGate.subagentGate()`——父 deny 规则传播到子代理，子代理不能越权。
+- **RulesetGate.explain()**：返回最高优先级 winning rule，SessionGate deny 时透出原因。
+
+**变更**
+
+- **OMP-R#1+OCL-R#4 重试升级**：`retryAfterHintFromHeaders()` 多源 hint 解析合并，重试策略更稳。
+- **OMP-R#7 memory 截断 marker**：fitBudget 截断时尾部附可行动提示。
+- **OMP-R#10 replay-policy**：deriveMessages 过滤 turn/end stopReason 含弃权语义的消息。
+- **kl-R#5 截断 recovery 消息**：截断后的续跑指令升级，恢复更稳。
+- **TUI footer hint 模式感知**：run-or-copy 确认（[R]un [C]opy [N]o）时底部提示同步。
 
 ## 0.5.0（2026-09-02）
 
