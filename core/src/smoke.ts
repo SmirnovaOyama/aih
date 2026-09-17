@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   AgentLoop,
   AutoApprove,
@@ -696,11 +697,18 @@ assert(retryRes.genMs === undefined, "non-streaming response carries no genMs (F
   });
   await sidLlm.complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
   await sidLlm.complete({ messages: [{ role: "user", content: "hi" }], tools: [], sessionId: "aih-compact-x" });
-  assert(
-    seen[0] === "s-20260907-121500",
-    `x-opencode-session resolves to the stable session id (got ${JSON.stringify(seen[0])})`,
-  );
-  assert(seen[1] === "aih-compact-x", "summary sessionId overrides the session-header lane");
+  // normalizeSid: malformed ids (aih session-file names like "s-YYYYMMDD-HHMMSS")
+  // are remapped to the gateway-accepted "ses_<26 base62>" form (live probe:
+  // "ses_s-20260905-214405" → 403 FreeTierError, "ses_<26>" → 200). The
+  // mapping is STABLE per input (one conversation = one gateway session) and
+  // per-request sessionId (compaction side-channel) gets its OWN id.
+  const VALID_SID = /^ses_[A-Za-z0-9]{26}$/;
+  assert(VALID_SID.test(seen[0]), `malformed sessionId remapped to valid ses_<26> (got ${JSON.stringify(seen[0])})`);
+  assert(VALID_SID.test(seen[1]), `aux sessionId also valid (got ${JSON.stringify(seen[1])})`);
+  assert(seen[0] !== seen[1], "main and aux session ids are isolated");
+  // Stability: a third request with the same main sessionId gets the same id.
+  await sidLlm.complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
+  assert(seen[2] === seen[0], "same main sessionId → same gateway id (stability)");
   // No sessionId option → a random id is minted per instance and stays stable
   // across that instance's calls (per-conversation affinity).
   const seen2: string[] = [];
@@ -814,7 +822,7 @@ for (let a = 0; a < 8; a += 1) {
     baseUrl: "https://example.invalid/v1",
     model: "m",
     retries: 0,
-    headers: { "x-opencode-session": "ses_{sid}", "x-opencode-request": "msg_{rand}" },
+    headers: { "x-opencode-session": "{sid}", "x-opencode-request": "msg_{rand}" },
     fetchImpl: (async (_url, init) => {
       seen.push({ ...((init as RequestInit)?.headers as Record<string, string>) });
       return new Response(
@@ -1906,6 +1914,30 @@ assert(
   blankLog.deriveMessages("sys").some((m) => m.role === "assistant" && Array.isArray(m.toolCalls) && m.toolCalls.length),
   "history preserved when summary is blank",
 );
+// Regression: a blank summary must NOT be a silent no-op — the context stays
+// bloated and the next LLM call may 400. Verify the stderr diagnostic fires
+// (subprocess so stderr is capturable without polluting this run).
+{
+  const { spawnSync } = await import("node:child_process");
+  const { join } = await import("node:path");
+  const script = [
+    'import { AgentLoop, MockLLM, SessionLog, ToolRegistry } from "./dist/index.js";',
+    'const log = new SessionLog();',
+    'log.append({ type: "user/message", turnId: "t", text: "filler" });',
+    'const llm = new MockLLM([{ text: "   " }]);',
+    'const loop = new AgentLoop({ llm, tools: new ToolRegistry(), log, contextWindow: 1000, compactAt: 0.8 });',
+    'const r = await loop.compactNow();',
+    'console.log("applied=" + r.applied);',
+  ].join("\n");
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: resolve(dirname(fileURLToPath(import.meta.url)), ".."),
+    encoding: "utf8",
+  });
+  const out = (r.stdout ?? "") + (r.stderr ?? "");
+  assert(r.status === 0, `blank-summary diagnostic subprocess exits 0 (got ${r.status}: ${out.slice(0, 200)})`);
+  assert(/applied=false/.test(r.stdout ?? ""), "blank summary reports applied=false");
+  assert(/compaction produced empty summary/.test(r.stderr ?? ""), "blank summary emits the stderr diagnostic (not a silent no-op)");
+}
 
 const manLog = new SessionLog();
 const manTools = new ToolRegistry(gate);

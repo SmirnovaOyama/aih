@@ -2960,6 +2960,42 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // P#35 regression — steering queued DURING the final LLM call (model is
+  // about to return no tool calls) must NOT be silently dropped. Before the
+  // fix the no-tool path `break`-ed out of the turn loop and the steering
+  // array was never drained, so the user's input vanished. Now it is drained
+  // into the log and the model gets one more step to process it. The steer
+  // fires from INSIDE complete() of the final response so the test genuinely
+  // exercises the break path (a steer before send() would be drained at the
+  // first loop-bottom drain and pass trivially).
+  const { AgentLoop, ToolRegistry, AutoApprove, SessionLog } = await import("@aih/core");
+  const log = new SessionLog();
+  let steerFired = false;
+  let loop: { steer: (t: string) => void; send: (t: string) => Promise<unknown> } | null = null;
+  const fakeLlm = {
+    async complete(): Promise<{ text: string; toolCalls: never[]; stopReason: "end_turn" }> {
+      // Steer while the final response is in flight — the moment the user
+      // types mid-turn, right before the model finishes.
+      if (!steerFired) {
+        steerFired = true;
+        loop?.steer("also do X");
+      }
+      return { text: "final answer", toolCalls: [], stopReason: "end_turn" };
+    },
+  };
+  loop = new AgentLoop({
+    llm: fakeLlm as never,
+    tools: new ToolRegistry(new AutoApprove()),
+    log,
+    systemPrompt: "sys",
+  });
+  await loop.send("hello");
+  assert(steerFired, "steer fired from inside the final LLM call");
+  const userMsgs = log.all().filter((e) => e.type === "user/message" && e.text === "also do X");
+  assert(userMsgs.length === 1, `steering queued during the final step is drained into the log (got ${userMsgs.length})`);
+}
+
+{
   // end-to-end: run_cmd child processes see a filtered environment
   const { ToolRegistry, AutoApprove } = await import("@aih/core");
   const { registerDevTools } = await import("./dev-tools.js");
@@ -3907,6 +3943,109 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // REGRESSION — question prompt must not be hidden above the viewport:
+  // askQuestion() forces scroll-to-bottom (pinned + follow) so the "❓
+  // question" line and the option rows are visible even when the user was
+  // browsing history (pinned=false, scrollTop>0) when the prompt appears.
+  const { Tui: TuiQ } = await import("./tui.js");
+  const qt = new TuiQ({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  // Fill the transcript, then scroll UP (browsing history → pinned=false).
+  for (let i = 0; i < 50; i++) qt.push({ role: "user", text: `history line ${i}` });
+  qt.requestPaint();
+  qt.feed("\x1b[H"); // VT Home → scrollTop=0, pinned=false (browsing history)
+  let st = qt.scrollStateForTest();
+  assert(st.pinned === false && st.scrollTop === 0, "pre: user is browsing history (pinned=false)");
+  const p = qt.askQuestion("Where should we ship?", ["A", "B"]);
+  void p.catch(() => {}); // cancelled below — swallow the rejection immediately
+  st = qt.scrollStateForTest();
+  assert(st.pinned === true, "askQuestion: pinned restored → prompt visible at bottom");
+  assert(st.scrollTop === st.contentLines - Math.min(st.contentLines, 24) || st.scrollTop > 0,
+    `askQuestion: scrolled to the bottom (scrollTop=${st.scrollTop}, content=${st.contentLines})`);
+  qt.feed("\x03"); // cancel the pending question
+
+  // REGRESSION — custom free-text mode must be EXITABLE (opencode: Esc exits
+  // editing back to the options; AIH: Backspace on an EMPTY answer buffer
+  // exits, since Esc belongs to the double-Esc detector). Before the fix,
+  // once in custom mode there was no key back to the option list.
+  const qt2 = new TuiQ({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const race = (p: Promise<string>) =>
+    Promise.race([p, new Promise((r) => setTimeout(() => r("TIMEOUT"), 400))]);
+  const p2 = qt2.askQuestion("Pick?", ["A", "B"]);
+  qt2.feed("\x1b[B\x1b[B\r"); // ↓ to "other" row, Enter → custom mode
+  await new Promise((r) => setTimeout(r, 40));
+  // Type a wrong answer, delete it all, then Backspace-on-empty → back to
+  // the option list (selection on the "other" row).
+  qt2.feed("wrong");
+  qt2.feed("\x7f\x7f\x7f\x7f\x7f"); // delete "wrong"
+  qt2.feed("\x7f"); // empty-buffer backspace → exit custom mode
+  const il2 = qt2.inputLayoutForTest(40);
+  assert(
+    /other \(type your own\)/.test(il2.lines.join("\n")) &&
+      il2.lines.some((l) => l.includes("▸") && l.includes("other")),
+    "custom exit: option list re-rendered with the 'other' row selected",
+  );
+  // From the restored list, digit keys work again → pick option 1.
+  qt2.feed("1");
+  assert((await race(p2)) === "A", "custom exit: digit selection works again after returning to options");
+
+  // Enter on an EMPTY custom buffer also exits back to the options
+  // (mimo-code/opencode parity — an empty answer is not submitted).
+  const qt4 = new TuiQ({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const p4 = qt4.askQuestion("Pick?", ["A", "B"]);
+  qt4.feed("\x1b[B\x1b[B\r"); // → custom mode
+  await new Promise((r) => setTimeout(r, 40));
+  qt4.feed("\r"); // empty-buffer Enter → back to options
+  const il4 = qt4.inputLayoutForTest(40);
+  assert(
+    il4.lines.some((l) => l.includes("▸") && l.includes("other")),
+    "empty-Enter: exits custom mode back to the option list",
+  );
+  qt4.feed("2");
+  assert((await race(p4)) === "B", "empty-Enter: digit selection works after returning");
+
+  // And the normal path still works: custom text + Enter submits.
+  const qt3 = new TuiQ({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const p3 = qt3.askQuestion("Pick?", ["A", "B"]);
+  qt3.feed("\x1b[B\x1b[B\r");
+  await new Promise((r) => setTimeout(r, 40));
+  qt3.feed("my answer\r");
+  assert((await race(p3)) === "my answer", "custom: typed answer still submits with Enter");
+  console.log("ok: question UX — scroll-to-bottom on prompt + custom-mode exit (⌫ back to options)");
+}
+
+{
   // REGRESSION (0.8.10→): options must survive the WHOLE real chain —
   // GeneralTools `question` execute → the wired `ask` callback (index.ts
   // passes `(q, options)` into Tui.askQuestion) → TUI option rows rendered.
@@ -3958,6 +4097,54 @@ await srv.connect(new StdioServerTransport());
     indexSrc.includes("makeStdinAsk(q, options)");
   assert(wiringOk, "index.ts ask wiring forwards (q, options) — options are never dropped at the TUI boundary");
   console.log("ok: question options via REAL chain — GeneralTools → ask callback → TUI rows + digit answer");
+}
+
+{
+  // opencode DialogModel parity — model picker MRU ("recently used first").
+  // recordModelUse prepends + dedupes + caps; sortByRecent floats MRU-hit
+  // catalog entries to the top in most-recent order and keeps the rest in
+  // config order; a fresh/empty MRU leaves the catalog order untouched.
+  const { recordModelUse, readMru, sortByRecent, mruKey } = await import("./mru.js");
+  const sandbox = join(process.cwd(), `.smoke-mru-${Date.now()}`);
+  const env = { AIH_HOME: sandbox, HOME: sandbox, PATH: process.env.PATH ?? "" };
+  // record + dedupe + cap
+  let list = recordModelUse("qwen", "qwen3-flash", env, () => "2026-09-15T01:00:00Z");
+  list = recordModelUse("opencode", "hy3-free", env, () => "2026-09-15T02:00:00Z");
+  list = recordModelUse("qwen", "qwen3-flash", env, () => "2026-09-15T03:00:00Z"); // re-use → moves to front, deduped
+  assert(list.length === 2, `mru: dedupe keeps one entry per provider/model (got ${list.length})`);
+  assert(list[0].provider === "qwen" && list[0].model === "qwen3-flash", `mru: re-used entry moves to front (got ${JSON.stringify(list[0])})`);
+  assert(readMru(env).length === 2, "mru: persisted list read back");
+  // cap at MRU_MAX
+  for (let i = 0; i < 30; i++) recordModelUse(`p${i}`, `m${i}`, env, () => `2026-09-15T${String(10 + i).padStart(2, "0")}:00:00Z`);
+  assert(readMru(env).length <= 20, `mru: capped at MRU_MAX (got ${readMru(env).length})`);
+  // sortByRecent: MRU-hit first, most-recent first; rest keep config order
+  const cat = [
+    { provider: "a", model: "m1", baseUrl: "x" },
+    { provider: "b", model: "m2" },
+    { provider: "c", model: "m3" },
+    { provider: "d", model: "m4" },
+  ];
+  const mru = [
+    { provider: "c", model: "m3", ts: "2026-09-15T05:00:00Z" }, // most recent
+    { provider: "a", model: "m1", ts: "2026-09-15T04:00:00Z" },
+  ];
+  const sorted = sortByRecent(cat, mru);
+  assert((sorted[0]?.provider ?? "") === "c" && (sorted[1]?.provider ?? "") === "a",
+    `mru: MRU-hit entries float to front, most-recent first (got ${sorted.map((e) => e.provider).join(",")})`);
+  assert((sorted[2]?.provider ?? "") === "b" && (sorted[3]?.provider ?? "") === "d",
+    `mru: non-MRU entries keep config order after the recents (got ${sorted.map((e) => e.provider).join(",")})`);
+  assert(sortByRecent(cat, []).map((e) => e.provider).join(",") === "a,b,c,d", "mru: empty MRU → catalog order untouched");
+  assert(cat[0]?.provider === "a", "mru: sortByRecent does not mutate the input array");
+  // index.ts wiring: the picker must consult `recent` for BOTH display and
+  // the picked entry (a catalog[idx] would mis-map once MRU reorders).
+  const idxSrc = readFileSync(join(process.cwd(), "cli", "src", "index.ts"), "utf8");
+  assert(
+    idxSrc.includes("const recent = sortByRecent(catalog, readMru())") &&
+      idxSrc.includes("const entry = recent[idx]"),
+    "index.ts model picker: sorts catalog by recent AND resolves the pick from the sorted list (no off-by-order mapping)",
+  );
+  rmSync(sandbox, { recursive: true, force: true });
+  console.log("ok: model picker MRU — record/dedupe/cap, sortByRecent order, picker wiring uses the sorted list");
 }
 
 {
@@ -4184,6 +4371,81 @@ process.exit(ok === false ? 0 : 1);`;
 }
 
 {
+  // P#35 recallSteering: retract a pending steer, keep a consumed one ──────
+  {
+    const { AgentLoop, ToolRegistry, AutoApprove, MockLLM } = await import("@aih/core");
+    const mk = () => new AgentLoop({ llm: new MockLLM([]), tools: new ToolRegistry(new AutoApprove()), maxStepsPerTurn: 4 });
+
+    const r1 = mk();
+    r1.steer("first");
+    r1.steer("second");
+    assert(r1.recallSteering() === "second", "recall pops the LAST pending steer");
+    assert(r1.hasQueued(), "one steer still pending after recall");
+    assert(r1.recallSteering() === "first", "next recall gets the earlier one");
+    assert(r1.recallSteering() === null, "empty after all recalled");
+
+    const r2 = mk();
+    r2.steer("will-be-drained");
+    r2.drainQueued("steering");
+    assert(r2.recallSteering() === null, "drained steer cannot be recalled");
+
+    const r3 = mk();
+    r3.followUp("fu");
+    assert(r3.recallSteering() === null, "recallSteering leaves followUp alone");
+    assert(r3.hasQueued(), "followUp still queued");
+  }
+
+  // P#35 TUI: onRecallSteering hook retracts a pending steer into composer ──
+  {
+    const { Tui } = await import("./tui.js");
+    const base = { placeholder: ">", meta: () => ({ agent: "t", model: "m", provider: "p" }), cwd: "/tmp", statusLeft: "x", statusRight: "y", busy: () => true, onLine: () => {} };
+
+    // Hook returns true → recalled steer lands in the composer.
+    let t2: any;
+    t2 = new Tui({ ...base, onRecallSteering: () => { t2.loadEditor("edit-me"); return true; } });
+    assert(t2.editText() === "", "composer empty before recall");
+    t2.recallQueued();
+    assert(t2.editText() === "edit-me", "recalled steer lands in the composer");
+
+    // Hook returns false → falls back to internal #queue.
+    const t3 = new Tui({ ...base, onLineBusy: () => false, onRecallSteering: () => false });
+    t3.feed("/compact extra args\r"); // queued while busy (host declines steer)
+    assert(t3.queueSize() === 1, "busy input lands in the fallback queue");
+    t3.recallQueued();
+    assert(t3.editText() === "/compact extra args", "hook=false falls back to internal queue");
+
+    // Neither source → hint shown.
+    let hinted = false;
+    const t4 = new Tui({ ...base, onRecallSteering: () => false });
+    (t4 as any).pushSystem = (msg: string) => { if (msg.includes("no queued")) hinted = true; };
+    t4.recallQueued();
+    assert(hinted, "no sources → hint shown");
+
+    // Ctrl+R (\x12) triggers the same recall path as Alt+Up.
+    const t5 = new Tui({ ...base, onLineBusy: () => false, onRecallSteering: () => false });
+    t5.feed("/compact via ctrl+r\r"); // queued while busy
+    assert(t5.queueSize() === 1, "ctrl+r test: input queued");
+    t5.feed("\x12"); // Ctrl+R
+    assert(t5.queueSize() === 0, "Ctrl+R pulls the entry out of the queue");
+    assert(t5.editText() === "/compact via ctrl+r", "Ctrl+R recalled text is editable");
+  }
+
+  // P#35 steering visual: injected steer shows NO QUEUED badge + "→ injected" ──
+  {
+    const { Tui } = await import("./tui.js");
+    const sv = new Tui({
+      placeholder: ">", meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp", statusLeft: "x", statusRight: "y", busy: () => true, onLine: () => {},
+    });
+    // Simulate what index.ts onLineBusy does after the fix:
+    sv.push({ role: "user", text: "steer this" });           // no queued flag
+    sv.pushSystem("→ injected into running turn");            // confirmation line
+    const lines = sv.transcriptLines();
+    assert(lines.some((l) => l.includes("steer this")), "steering visual: user text rendered");
+    assert(!lines.some((l) => l.includes("QUEUED")), "steering visual: NO QUEUED badge (in-flight, not queued)");
+    assert(lines.some((l) => l.includes("→ injected")), "steering visual: '→ injected' confirmation shown");
+  }
+
   // P#35 — Alt+Up recalls the last queued message back into the editor.
   const { Tui } = await import("./tui.js");
   const lines: string[] = [];
@@ -5225,6 +5487,27 @@ process.exit(ok === false ? 0 : 1);`;
   assert(sys.some((l) => l.includes("boom")), "Q-R7: error row rendered");
   assert(sys.some((l) => l.includes("plain info")), "Q-R7: info row rendered");
   assert(!sys.some((l) => l.includes("\x1b[")), "Q-R7: non-TTY renders plain (no SGR)");
+
+  // opencode/mimo parity — steering input renders as a user message with a
+  // QUEUED badge; the badge clears when the turn settles (turnSettled →
+  // clearQueuedBadges). The user's text must always be visible.
+  const qTui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => true,
+    onLine: () => {},
+  });
+  qTui.push({ role: "user", text: "also do X", queued: true });
+  const qLines = qTui.transcriptLines();
+  assert(qLines.some((l) => l.includes("also do X")), "QUEUED: user text rendered");
+  assert(qLines.some((l) => l.includes("QUEUED")), "QUEUED: badge shown while queued");
+  qTui.turnSettled();
+  const qLines2 = qTui.transcriptLines();
+  assert(qLines2.some((l) => l.includes("also do X")), "QUEUED: user text still rendered after settle");
+  assert(!qLines2.some((l) => l.includes("QUEUED")), "QUEUED: badge cleared after turnSettled");
 
   // Q-R7 — tool rows: the tool NAME is blue (38;5;75, qwen tool palette),
   // including the collapsed-group header; failures stay red.
@@ -8840,6 +9123,51 @@ console.log("══════════════════════�
   await ok.complete({ messages: [{ role: "user", content: "hi" }], tools: [] } as any);
   assert(successes.includes("opencode"), "OC#7 successful completion calls onOwnerSuccess (recovery)");
   assert(degrades.length === 1, "OC#7 success does not degrade anyone");
+
+  // ---- {sid} normalizes to the gateway-accepted "ses_<26 base62>" id ----
+  // Live probe (2026-09-17, opencode.ai/zen/v1, full client-identity header
+  // set): "ses_s-20260905-214405" → 403 FreeTierError, "ses_<26 base62>" →
+  // 200. The gateway validates the id FORMAT, not just the prefix. aih
+  // session files are named "s-YYYYMMDD-HHMMSS" and were passed straight
+  // into x-opencode-session → every request 403'd. normalizeSid remaps any
+  // non-conforming id to a fresh valid body, STABLE per input (one
+  // conversation = one gateway session across requests).
+  {
+    const mk = (sessionId?: string) => {
+      let captured: Record<string, string> | null = null;
+      const llm = new OpenAICompatibleLLM({
+        baseUrl: "https://api.example.com/v1",
+        model: "m",
+        headers: { "x-opencode-session": "{sid}" },
+        fetchImpl: async (_url: unknown, init: RequestInit) => {
+          captured = Object.fromEntries(new Headers(init?.headers as Record<string, string>).entries());
+          return new Response(JSON.stringify({ choices: [{ message: { content: "ok", role: "assistant" }, finish_reason: "stop" }], usage: {} }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      });
+      const run = (sid?: string) =>
+        llm.complete({ messages: [{ role: "user", content: "hi" }], tools: [] as any, ...(sid ? { sessionId: sid } : {}) } as any);
+      return { run, get: () => captured?.["x-opencode-session"] ?? "" };
+    };
+    // 1. Default (no caller id) → valid ses_<26>.
+    const d = mk();
+    await d.run();
+    assert(/^ses_[A-Za-z0-9]{26}$/.test(d.get()), `default "{sid}" is a valid ses_<26> id (got ${JSON.stringify(d.get())})`);
+    // 2. aih session-file id (the real-world 403 case) → remapped to valid form.
+    const a = mk("s-20260905-214405");
+    await a.run("s-20260905-214405");
+    assert(/^ses_[A-Za-z0-9]{26}$/.test(a.get()), `malformed caller id remapped to ses_<26> (got ${JSON.stringify(a.get())})`);
+    // 3. Same input twice → STABLE (gateway session continuity).
+    const first = a.get();
+    await a.run("s-20260905-214405");
+    assert(a.get() === first, "same caller id maps to the same gateway id (stability)");
+    // 4. Already-valid opencode id passes through unchanged (no double prefix).
+    const v = mk();
+    await v.run("ses_f52ee61ecffeIywXD7zg4KfC9R");
+    assert(v.get() === "ses_f52ee61ecffeIywXD7zg4KfC9R", "valid ses_<26> id passes through unchanged");
+  }
 
   console.log("ok: OC#7 credential ownership isolation (owner-state + adapter hook)");
 }

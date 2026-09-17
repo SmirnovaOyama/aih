@@ -20,6 +20,37 @@ import type { LLMAdapter } from "./llm.js";
  */
 let idLastTs = 0;
 let idCounter = 0;
+/**
+ * Normalize a caller-supplied id into the gateway-accepted form
+ * ("ses_" + 26 base62). Live probe (2026-09-17, opencode.ai/zen/v1) with
+ * the full client-identity header set: "ses_s-20260905-214405" → 403
+ * FreeTierError, "ses_<26 base62>" → 200. The gateway validates the id
+ * FORMAT, not just the prefix, so ids from other tools (aih session files
+ * "s-YYYYMMDD-HHMMSS", opencode's own "ses_*" ids) must be remapped to a
+ * fresh valid body. The mapping is stable per input so the gateway keeps
+ * one conversation = one session id across requests.
+ */
+const SID_BODY_RE = /^[A-Za-z0-9]{26}$/;
+const sidBodyCache = new Map<string, string>();
+function normalizeSid(raw: string, key: string): string {
+  // The gateway validates the id FORMAT ("ses_" + 26 base62), not just the
+  // prefix: live probe (2026-09-17, opencode.ai/zen/v1, full identity
+  // headers) — "ses_s-20260905-214405" → 403 FreeTierError, "ses_<26>" → 200.
+  // aih session files are named "s-YYYYMMDD-HHMMSS" and were passed straight
+  // into x-opencode-session → every request 403'd. Remap non-conforming ids
+  // to a fresh valid body, STABLE per input (one conversation = one gateway
+  // session across requests; aux calls keep their own identity, P#36⑤).
+  // Templates carry the "ses_" prefix ("ses_{sid}"); this returns the FULL
+  // qualified form so configs and the catalog default agree on one shape.
+  const body = raw.startsWith("ses_") ? raw.slice(4) : raw;
+  if (SID_BODY_RE.test(body)) return `ses_${body}`;
+  const hit = sidBodyCache.get(key);
+  if (hit) return hit;
+  const fresh = `ses_${opencodeIDBody()}`;
+  sidBodyCache.set(key, fresh);
+  return fresh;
+}
+
 function opencodeIDBody(): string {
   const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
   let rand = "";
@@ -255,7 +286,10 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       let out = v;
       // P#36: auxiliary calls (compaction summaries) carry their own
       // session id so "{sid}" resolves to the side-channel identity.
-      if (out.includes("{sid}")) out = out.split("{sid}").join(req.sessionId ?? this.#sid);
+      if (out.includes("{sid}"))
+        out = out
+          .split("{sid}")
+          .join(normalizeSid(req.sessionId ?? this.#sid, req.sessionId ?? this.#sid));
       if (out.includes("{rand}")) out = out.split("{rand}").join(opencodeIDBody());
       headers[k] = out;
     }

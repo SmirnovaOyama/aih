@@ -82,6 +82,7 @@ import {
 import { buildSafetyHooks, ESCALATE_EXIT_CODE } from "./safety.js";
 import type { SafetyHooks } from "./safety.js";
 import { projectTrustState, setProjectTrustState, sanitizeCredential } from "./config.js";
+import { recordModelUse, readMru, sortByRecent } from "./mru.js";
 import { collectRulesSync, renderRules } from "./rules.js";
 import { migrateConfigFile, configMigrationTargets } from "./migrate.js";
 import { buildKeybindDispatch, loadKeybinds } from "./keybinds.js";
@@ -241,7 +242,7 @@ import {
   type Trace,
 } from "./measure.js";
 
-export const VERSION = "0.8.11";
+export const VERSION = "0.8.12";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );
@@ -2363,6 +2364,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       // regression that lastContextTokens guards against stays covered.
       usedTokens = estimateContextTokens(log.all());
       loop = makeLoop();
+      // opencode parity — MRU: remember this successful switch so the model
+      // picker floats it to the top next time. Recorded only on SUCCESS (a
+      // failed switch rolls back flags but must not pollute recents).
+      recordModelUse(provider ?? "(default)", modelId);
     } catch (err) {
       // A failed switch (e.g. target provider has no API key) must not kill
       // the session: roll back and report in-band.
@@ -2436,9 +2441,13 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       providerLabel === "custom" ? undefined : providerLabel,
       modelLabel,
     );
+    // opencode DialogModel parity — MRU first: entries used most recently
+    // float to the top (deduped by provider/model), the rest keep config
+    // order. Read is silent on failure (empty MRU → plain config order).
+    const recent = sortByRecent(catalog, readMru());
     const short = (u?: string): string =>
       !u ? "" : u.replace(/^https?:\/\//, "").replace(/\/v1\/?$/, "") || u;
-    const entries = catalog.map((e: ModelCatalogEntry) => ({
+    const entries = recent.map((e: ModelCatalogEntry) => ({
       label: `${e.provider}/${e.model}`,
       ...(e.baseUrl ? { hint: short(e.baseUrl) } : {}),
       ...(e.active ? { active: true } : {}),
@@ -2472,7 +2481,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         return;
       }
     }
-    const entry = catalog[idx];
+    const entry = recent[idx];
     if (!entry || entry.active) return;
     await applyModel(entry.provider === "(default)" ? undefined : entry.provider, entry.model);
     tui.pushSystem(
@@ -2684,7 +2693,24 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       // them. Known slash only: unknown "/..." is a message and gets steered.
       if (!t || isKnownSlash(t)) return false;
       loop.steer(t);
-      tui.pushSystem("↳ steering — lands before the next step of the running turn");
+      // A-accurate visual: the steering is injected into the running loop
+      // immediately (drained before the next LLM step). Show it as a user
+      // message WITHOUT a QUEUED badge (it's not queued — it's in-flight),
+      // plus a system line confirming injection. The QUEUED badge is reserved
+      // for true #queue entries (slash / host-declined) that wait for turn end.
+      tui.push({ role: "user", text: t });
+      tui.pushSystem(`→ injected into running turn`);
+      return true;
+    },
+    // P#35 — ↩ recall (Alt+Up): retract the most recent still-pending steer
+    // into the composer for editing/resubmission. Returns false once all
+    // steering has been consumed (the TUI then falls back to its internal
+    // queue / a hint).
+    onRecallSteering: () => {
+      const recalled = loop.recallSteering();
+      if (!recalled) return false;
+      tui.loadEditor(recalled);
+      tui.pushSystem("↩ recalled pending steering — edit and press Enter to resubmit");
       return true;
     },
     onLineKnownSlash: (line) => isKnownSlash(line),
@@ -3396,7 +3422,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     // unknown "/..." input is steered as a normal message.
     if (busy && !isKnownSlash(input)) {
       loop.steer(input);
-      tui.pushSystem("↳ steering — will land before the next step of the running turn");
+      // opencode/mimo parity: steering input shown as a user message with a
+      // QUEUED badge (cleared at turn end), not a dim system line.
+      tui.push({ role: "user", text: input, queued: true });
       return;
     }
 

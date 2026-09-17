@@ -361,6 +361,7 @@ When combining:
 - If a blocker has been resolved, update the summary to reflect that while keeping any details still needed to continue the work.
 - Update "Objective" and "Next Move" to reflect the current work state.
 - CRITICAL — never keep an item in "Objective" that is already done. Once the conversation shows a task was implemented, tested, or delivered (even if uncommitted), move it OUT of "Objective" and into "Completed"/"Active" with its verification state. "Objective" lists only what is genuinely NOT yet done. A stale Objective that duplicates a Completed item is the #1 cause of the agent re-doing finished work after compaction.
+- CRITICAL — preserve USER AUTHORIZATION STATE verbatim in "Important Details": any user directive about what IS or IS NOT allowed (e.g. "已获授权推送", "未经允许不 commit/push/release", "不修复", "勿再重做"). These are behavioral constraints, not work items — losing them after compaction causes the agent to either act without permission or re-do work the user explicitly declined.
 - Keep the summary in the SAME language as the conversation — match the user's language exactly.`;
 
 export class AgentLoop {
@@ -561,6 +562,20 @@ export class AgentLoop {
    */
   steer(text: string): void {
     this.#steering.push(text);
+  }
+
+  /**
+   * P#35 — recall (retract) the most recent steering message that has NOT
+   * yet been drained into the log. Returns the text and removes it from the
+   * queue, or null if there is nothing to recall (all steering already
+   * consumed by a step). Used by the TUI's "↩ recall" key: pull a still-
+   * pending steer back into the editor for editing/resubmission. Once a
+   * steering message has been drained it is part of the turn and can no
+   * longer be recalled (the user must issue a new instruction).
+   */
+  recallSteering(): string | null {
+    if (!this.#steering.length) return null;
+    return this.#steering.pop()!;
   }
 
   /** P#35 — queue a message for the next natural turn (not mid-turn). */
@@ -1029,6 +1044,16 @@ export class AgentLoop {
           const c = await this.#compactOrSkip(turnId);
           if (c.usage) usage = addUsage(usage, c.usage);
           if (c.applied) contextNow = this.#estimateContext();
+        }
+        // P#35 fix — steering queued during the final step must NOT be
+        // silently dropped: the model is about to end the turn, so drain
+        // the steering into the log and let it run one more step to
+        // process the user's instruction.
+        if (this.#steering.length > 0) {
+          for (const item of this.#steering.splice(0)) {
+            this.#log.append({ type: "user/message", turnId, text: item });
+          }
+          continue;
         }
         break;
       }
@@ -1577,8 +1602,12 @@ export class AgentLoop {
       // Auto-compaction must never be a silent no-op: a skipped compact on a
       // bloated session snowballs into minute-long model responses. One
       // stderr line keeps the failure diagnosable without a debug flag.
+      // Include trigger + turnId so a long session's "why didn't it compact"
+      // is traceable to the exact turn and the reason (summary LLM 403 /
+      // timeout / empty response) without a debug flag.
+      const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(
-        `[aih] auto-compaction failed (continuing without it): ${err instanceof Error ? err.message : String(err)}\n`,
+        `[aih] auto-compaction failed (turn=${turnId}, trigger=auto, continuing without it): ${msg}\n`,
       );
       return { usage: undefined, applied: false };
     });
@@ -1626,7 +1655,16 @@ export class AgentLoop {
       .filter(Boolean)
       .join("\n\n");
     const { text, usage } = await this.#summarizeHead(head, previousSummary, effectiveInstructions || undefined);
-    if (!text.trim()) return { usage, applied: false };
+    if (!text.trim()) {
+      // An empty summary is a silent no-op: the context stays bloated and
+      // the next LLM call may 400 (context overflow) or hang. One stderr
+      // line keeps the failure diagnosable without a debug flag (same
+      // principle as #compactOrSkip's catch).
+      process.stderr.write(
+        `[aih] compaction produced empty summary (turn=${turnId}, head=${head.length} msgs) — context NOT reduced\n`,
+      );
+      return { usage, applied: false };
+    }
     // User-query invariant (opencode/MiMo-Code "replay"): the compaction must
     // never strand the conversation without a visible user turn — strict chat
     // templates (Qwen3: "No user query found in messages") 400 otherwise.
@@ -1653,10 +1691,11 @@ export class AgentLoop {
       upToSeq,
       digest: coverageDigest(allEvents.filter((e) => e.seq <= upToSeq)),
     };
+    const summaryText = text.slice(0, 12000);
     this.#log.append({
       type: "compaction",
       turnId,
-      summary: text.slice(0, 12000),
+      summary: summaryText,
       coverage,
       ...(recent.length > 0 ? { recent } : {}),
       ...(opts?.trigger ? { trigger: opts.trigger } : {}),

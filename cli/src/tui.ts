@@ -53,6 +53,8 @@ export interface TuiItem {
   red?: boolean;
   sysKind?: SysKind;
   tool?: ToolView;
+  /** opencode/mimo parity: steering input shown with a QUEUED badge until the turn settles. */
+  queued?: boolean;
 }
 
 export interface TuiOptions {
@@ -78,6 +80,14 @@ export interface TuiOptions {
    * Return false to fall back to the internal queue (shown as "queued").
    */
   onLineBusy?(line: string): boolean;
+  /**
+   * P#35 — recall (retract) the most recent still-pending steering message
+   * back into the editor for editing/resubmission. Called by the "↩ recall"
+   * key (Alt+Up, when no internal-queue entry is left). Returns true if a
+   * steering was recalled (host put it in the editor), false if nothing to
+   * recall (all steering already consumed — fall back to a hint).
+   */
+  onRecallSteering?(): boolean;
   /** Is this trimmed input a KNOWN slash command? (used for queue labels) */
   onLineKnownSlash?(line: string): boolean;
   ctxUsage?(): {
@@ -196,7 +206,7 @@ const ESC_NOISE_MS = 150;
 const HELP_LINES: string[] = [
   bold("keys"),
   "    enter send · esc cancel turn (or clear) · esc esc also cancels",
-  "    up/down recall history · Alt+Up recall queued · tab complete · ctrl-p palette",
+  "    up/down recall history · Ctrl+R / Alt+Up ↩ recall queued · tab complete · ctrl-p palette",
   "    ? help (empty input) · mouse scroll/click · enter expand",
   bold("state"),
   "    ▶ running   ✓ ok   ✗ failed   ● active model",
@@ -1195,12 +1205,32 @@ constructor(opts: TuiOptions) {
     this.#histCursor = -1;
   }
 
+  /**
+   * opencode/mimo parity — drop the QUEUED badges from user messages
+   * (steering inputs that have now been consumed). Call at turn end.
+   */
+  clearQueuedBadges(): void {
+    let changed = false;
+    for (const item of this.#items) {
+      if (item.queued) {
+        item.queued = false;
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.#itemCache.clear(); // queued flag changed → cached rows are stale
+      this.#panelSeq += 1;
+      this.requestPaint();
+    }
+  }
+
   turnSettled(): void {
     if (this.#pendingExit) {
       this.#pendingExit = false;
       this.stop();
       process.exit(0);
     }
+    this.clearQueuedBadges();
   }
 
   setStatusRight(text: string): void {
@@ -1299,6 +1329,11 @@ constructor(opts: TuiOptions) {
     }
     this.pushSystem(`❓ ${question}`);
     this.#qbuf = "";
+    // Scroll to the bottom so the question text + option list are visible.
+    // Without this, a user who was browsing history (#pinned=false) sees
+    // only the option rows — the question is above the viewport.
+    this.#pinned = true;
+    this.#follow();
     this.requestPaint();
     return new Promise((resolve, reject) => {
       // opencode question-parity: when the caller passes concrete choices,
@@ -1841,6 +1876,15 @@ constructor(opts: TuiOptions) {
             done.resolve(opt);
             return;
           }
+        } else if (done.custom && done.options && !this.#qbuf) {
+          // mimo-code/opencode parity: Enter on an EMPTY custom buffer does
+          // NOT submit an empty answer — it exits editing back to the option
+          // list (selection on the "other" row, so ↓↑ can walk the real
+          // options). Before this, empty-Enter submitted "" and the user was
+          // stuck with no way back to the choices.
+          this.#question = { ...done, custom: false, sel: done.options.length };
+          this.requestPaint();
+          return;
         }
         this.#question = null;
         const answer = this.#qbuf;
@@ -1863,6 +1907,15 @@ constructor(opts: TuiOptions) {
         this.requestPaint();
         done.reject(new Error("user cancelled the question"));
       } else if (ch === "\x7f") {
+        if (done.custom && done.options && !this.#qbuf) {
+          // opencode question-parity: Esc exits custom editing back to the
+          // option list. AIH's Esc is consumed by the double-Esc detector,
+          // so Backspace-on-empty-input is the exit: the user has nothing
+          // to delete, so it means "back to the options".
+          this.#question = { ...done, custom: false, sel: done.options.length };
+          this.requestPaint();
+          return;
+        }
         this.#qbuf = this.#qbuf.slice(0, -1);
         this.requestPaint();
       } else if (ch >= " ") {
@@ -1989,6 +2042,9 @@ constructor(opts: TuiOptions) {
         this.#edit = "";
         this.#cursor = 0;
         this.requestPaint();
+        return;
+      case "\x12": // Ctrl+R — P#35: recall the last queued message (Alt+↑ alternative)
+        this.recallQueued();
         return;
       case "\x7f":
         if (this.#cursor > 0) {
@@ -2246,13 +2302,22 @@ constructor(opts: TuiOptions) {
   }
 
   /**
-   * P#35 — Alt+Up: pull the most recent queued (or steering-declined) input
-   * back into the editor for editing and resubmission. Nothing is lost: the
-   * entry is removed from the queue and becomes editable text.
+   * P#35 — Alt+Up (↩ recall): pull the most recent pending input back into
+   * the editor for editing and resubmission. Two sources, in priority order:
+   *   1. a still-pending STEERING message (host hook onRecallSteering) —
+   *      opencode/mimo parity: retract a steer that has not yet been drained
+   *      by a step, edit it, resubmit. Once consumed it is gone from here.
+   *   2. the internal #queue (slash / host-declined lines awaiting turn end).
+   * Nothing is lost: the recalled entry leaves its queue and becomes editable
+   * text in the composer.
    */
   recallQueued(): void {
+    if (this.#opts.onRecallSteering?.()) {
+      this.requestPaint();
+      return;
+    }
     if (!this.#queue.length) {
-      this.pushSystem("no queued messages to recall");
+      this.pushSystem("no queued or pending steering to recall");
       return;
     }
     const line = this.#queue.pop()!;
@@ -2278,6 +2343,14 @@ constructor(opts: TuiOptions) {
     this.#edit = value;
     this.#cursor = value.length;
     this.requestPaint();
+  }
+
+  /**
+   * P#35 — load text into the composer (cursor at end). Used by the host's
+   * onRecallSteering hook to place a recalled steering message for editing.
+   */
+  loadEditor(text: string): void {
+    this.#setEdit(text);
   }
 
   /**
@@ -3105,6 +3178,26 @@ constructor(opts: TuiOptions) {
         const rows = [this.#userRow("")];
         for (const line of body) rows.push(this.#userRow(line));
         rows.push(this.#userRow(""));
+        // opencode/mimo parity: steering input carries a QUEUED badge until the
+        // turn settles (clearQueuedBadges at turnSettled). Badge = bold " QUEUED "
+        // on the user accent background, right-aligned on its own metadata row.
+        if (item.queued) {
+          const badge = " QUEUED ";
+          const pad = Math.max(0, this.#bodyCols() - 4 - badge.length);
+          // opencode/mimo: badge bg = the message's accent (user = cyan), fg =
+          // the surface, bold. Reverse-video on cyan text swaps fg/bg against
+          // the row's surface — theme-correct by construction (no hardcoded
+          // surface color to drift out of sync). Built by hand (not #userRow)
+          // so the trailing RESET does not kill the badge's reverse video.
+          const bg = this.#surface();
+          const line =
+            cyan("┃") +
+            "  " +
+            " ".repeat(pad) +
+            cyan(REV + bold(badge) + RESET) +
+            RESET;
+          rows.push(bg + this.#clip(line, this.#bodyCols()).split(RESET).join(RESET + bg) + RESET);
+        }
         return rows;
       }
       case "system": {
@@ -3365,8 +3458,14 @@ constructor(opts: TuiOptions) {
     if (this.#question) {
       // Hint only while the answer is empty — once the user types, the hint
       // must step aside (it was crowding the answer text and made the input
-      // look like a placeholder that never cleared).
-      const hint = this.#qbuf ? "" : dim("  Enter to send · ctrl-c to cancel");
+      // look like a placeholder that never cleared). In custom mode with an
+      // empty buffer, advertise the backspace-to-options exit (opencode uses
+      // Esc; AIH's Esc is the double-Esc detector, so backspace is the exit).
+      const hint = this.#qbuf
+        ? ""
+        : this.#question.custom && this.#question.options
+          ? dim("  type answer · Enter send · ⌫ back to options · ctrl-c cancel")
+          : dim("  Enter to send · ctrl-c to cancel");
       // Long answers wrap (same limit as the composer) so a long question
       // answer never vanishes behind the box's right edge.
       const qlimit = Math.max(4, width - 6);
