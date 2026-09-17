@@ -1,0 +1,756 @@
+#!/usr/bin/env bash
+# Build a fully OFFLINE, self-extracting installer for AIH.
+#
+# Output: dist-offline/aih-<version>-offline.sh   (macOS/Linux, POSIX sh)
+#         dist-offline/aih-<version>-offline.ps1  (Windows, PowerShell 5.1+)
+#   Each is a single-file self-extracting installer whose tail holds the same
+#   gzipped tarball payload (raw-append for .sh, base64 for .ps1):
+#     aih / aih.cmd    ← launchers (ESM node script + cmd shim)
+#     lib/{core,cli,mcp-server}/  ← workspace dists + manifests
+#     node_modules/    ← FULL production dependency closure (no npm/net needed)
+#     config/global-config.json ← merged DEFAULT global config (see below)
+#
+# Config handling follows aih's own layering rules (cli/src/config.ts):
+#   packaging merges legacy ~/.aih/config.json < global <XDG>/aih/config.json
+#   < ./aih.json (per top-level key, like runtime Object.assign) into ONE
+#   default; install deploys it to the RESOLVED global dir (AIH_HOME >
+#   $XDG_DATA_HOME/aih > ~/.local/share/aih, legacy ~/.aih compat) as
+#   config.json — never overwriting an existing one. Project overrides keep
+#   working via ./aih.json as usual.
+#
+# Install:   sh aih-*-offline.sh                    | powershell -ep Bypass -File aih-*-offline.ps1
+# Uninstall: sh aih-*-offline.sh uninstall [--purge-config]
+#            powershell -File aih-*-offline.ps1 uninstall -PurgeConfig
+#
+# Packaging artifacts are NOT tracked by git (excluded via .git/info/exclude):
+#   scripts/offline-package and dist-offline/.
+#
+# Usage:
+#   bash scripts/offline-package          # default output dir dist-offline/
+#   OUT_DIR=release bash scripts/offline-package
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+VERSION=$(grep -oE 'const VERSION = "[^"]+"' cli/src/index.ts | head -1 | sed 's/.*"\(.*\)"/\1/')
+[ -n "$VERSION" ] || VERSION=$(node -p "require('./package.json').version")
+OUT_DIR=${OUT_DIR:-dist-offline}
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+
+[ -f aih.json ] || { echo "error: ./aih.json not found (required payload)" >&2; exit 1; }
+
+echo "==> building"
+npm run build >/dev/null
+
+echo "==> staging lib/ (workspaces dist + manifests)"
+mkdir -p "$STAGE/lib"
+for ws in core cli mcp-server; do
+  mkdir -p "$STAGE/lib/$ws"
+  cp -r "$ws/dist" "$STAGE/lib/$ws/dist"
+  cp "$ws/package.json" "$STAGE/lib/$ws/package.json"
+done
+
+echo "==> staging full production dependency closure (offline)"
+node - "$STAGE" <<'NODE_EOF'
+const fs = require("fs"), path = require("path");
+const stage = process.argv[2];
+const roots = ["@modelcontextprotocol/sdk", "string-width", "zod"];
+const seen = new Set(), stack = [...roots];
+while (stack.length) {
+  const name = stack.pop();
+  if (seen.has(name)) continue;
+  seen.add(name);
+  const pjPath = path.join("node_modules", name, "package.json");
+  if (!fs.existsSync(pjPath)) { console.error("    warn: missing " + name); continue; }
+  const pj = JSON.parse(fs.readFileSync(pjPath, "utf8"));
+  for (const d of Object.keys(pj.dependencies ?? {})) stack.push(d);
+}
+let count = 0;
+for (const n of [...seen].sort()) {
+  const dest = path.join(stage, "node_modules", n);
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.cpSync(path.join("node_modules", n), dest, { recursive: true });
+  count++;
+}
+console.log("    copied " + count + " packages");
+NODE_EOF
+
+mkdir -p "$STAGE/node_modules/@aih"
+for ws in core cli mcp-server; do
+  ln -s "../../lib/$ws" "$STAGE/node_modules/@aih/$ws"
+done
+
+echo "==> writing root manifest (type: module)"
+# The launcher is extensionless; its module type comes from the NEAREST
+# package.json. Node >= 22 auto-detects ESM so this went unnoticed locally,
+# but Node 20.x needs the explicit "type": "module" (same as scripts/package).
+cat > "$STAGE/package.json" <<EOF
+{
+  "name": "aih",
+  "version": "$VERSION",
+  "private": true,
+  "type": "module"
+}
+EOF
+echo "==> bundling merged global config (legacy < global < project)"
+# Merge the same layers runtime reads (per top-level key, later wins) into one
+# default config: legacy ~/.aih/config.json, then the resolved global
+# config.json, then ./aih.json. Mirrors cli/src/config.ts loadLayers().
+node - "$STAGE" <<'NODE_EOF'
+const fs = require("fs"), path = require("path"), os = require("os");
+const stage = process.argv[2];
+const home = process.env.HOME && process.env.HOME.length > 0 ? process.env.HOME : os.homedir();
+let user;
+if (process.env.AIH_HOME) {
+  user = process.env.AIH_HOME;
+} else if (process.env.XDG_DATA_HOME) {
+  user = path.join(process.env.XDG_DATA_HOME, "aih");
+} else {
+  user = path.join(home, ".local", "share", "aih");
+}
+const legacy = path.join(home, ".aih");
+if (!fs.existsSync(user) && fs.existsSync(legacy)) user = legacy; // legacy compat
+
+const readJson = (p) => {
+  try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return {}; }
+};
+const merged = Object.assign(
+  {},
+  readJson(path.join(legacy, "config.json")),
+  readJson(path.join(user, "config.json")),
+  readJson("aih.json"),
+);
+// Opt-in: explicitly drop named providers from the packaged default (e.g.
+// local bare-IP llamacpp endpoints that live in the build machine's aih.json
+// but must not ship publicly). Comma-separated; the guard below still applies
+// to every provider that remains.
+const drop = (process.env.AIH_PACKAGE_DROP_PROVIDERS || "").split(",").map(s => s.trim()).filter(Boolean);
+if (drop.length && merged.providers) {
+  for (const name of drop) {
+    if (merged.providers[name]) {
+      delete merged.providers[name];
+      console.log(`    dropped provider (AIH_PACKAGE_DROP_PROVIDERS): ${name}`);
+    }
+  }
+}
+// Hard guarantee: the packaged default MUST carry models & providers —
+// refuse to build an installer without them.
+if (!merged.providers || !Object.keys(merged.providers).length) {
+  console.error("error: merged config has no providers — refusing to package");
+  process.exit(1);
+}
+// Security guard (post-v0.3.0 leak): a provider pointing at a private /
+// internal / bare-IP endpoint must never ship in a public installer. The
+// layering merge can silently pick these up from the build machine's local
+// aih.json — fail the build instead of leaking the address.
+const INTERNAL_HOST = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.0\.0\.0|\[?::1\]?$)|(\.internal$|\.local$|\.lan$)/i;
+for (const [name, p] of Object.entries(merged.providers)) {
+  if (!p.baseUrl || !p.model) {
+    console.error(`error: provider "${name}" is missing baseUrl/model — refusing to package`);
+    process.exit(1);
+  }
+  let host = "";
+  try {
+    host = new URL(p.baseUrl).hostname;
+  } catch {
+    console.error(`error: provider "${name}" baseUrl is not a valid URL (${p.baseUrl}) — refusing to package`);
+    process.exit(1);
+  }
+  if (
+    INTERNAL_HOST.test(host) ||
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) // any bare IPv4 literal — public IPs don't belong in shipped defaults either
+  ) {
+    console.error(
+      `error: provider "${name}" points at an internal/private endpoint (${host}) — ` +
+        `remove it from the packaged layers or override with a public URL before packaging`,
+    );
+    process.exit(1);
+  }
+}
+// T1 P1 — secret-shape scan over the ENTIRE merged config (values, not just
+// provider fields). Non-provider top-level keys (custom headers, envFile
+// values, embedded tokens) would otherwise ship verbatim; the v0.3.0 fix
+// only covered provider baseUrl. Opt out per-shape by sanitizing the source
+// config — a public installer must never carry machine-local credentials.
+const SECRET_SHAPES =
+  /(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|(?:api|key|token)["']?\s*[:=]\s*["']?[A-Za-z0-9_-]{20,})/i;
+function scan(obj, path) {
+  if (typeof obj === "string") {
+    if (SECRET_SHAPES.test(obj)) {
+      console.error(
+        `error: merged config value at "${path}" matches a credential shape — refusing to package ` +
+          "(sanitize the source config or move the secret to an env file)",
+      );
+      process.exit(1);
+    }
+    return;
+  }
+  if (Array.isArray(obj)) { obj.forEach((v, i) => scan(v, `${path}[${i}]`)); return; }
+  if (obj && typeof obj === "object") {
+    for (const [k, v] of Object.entries(obj)) scan(v, path ? `${path}.${k}` : k);
+  }
+}
+// Packaged default: strip opencode's CLIENT-IDENTITY headers before they can
+// ship in a public installer. x-opencode-session / x-opencode-client /
+// x-opencode-project / x-opencode-request / user-agent identify the OPENCODE
+// official client — AIH must not impersonate it (ToS/red line, 2026-08-23).
+// Free models stay; users who want the zen tier configure headers themselves.
+const OPENCODE_IDENTITY_HEADERS = [
+  "x-opencode-session",
+  "x-opencode-client",
+  "x-opencode-project",
+  "x-opencode-request",
+  // user-agent identifies the opencode official client build too ("opencode/1.17.11
+  // ai-sdk/provider-utils/... runtime/bun/...") — strip it alongside the x-* set.
+  "user-agent",
+];
+for (const [name, p] of Object.entries(merged.providers || {})) {
+  if (!p.headers || typeof p.headers !== "object") continue;
+  if (!/^https?:\/\/([^/]*\.)?opencode\.ai(?:[:/]|$)/i.test(p.baseUrl || "")) continue;
+  let changed = false;
+  for (const h of OPENCODE_IDENTITY_HEADERS) {
+    if (p.headers[h]) {
+      delete p.headers[h];
+      changed = true;
+    }
+  }
+  if (changed) {
+    // Mark the provider keyless so buildRealLlm's "no API key" guard passes.
+    // opencode zen free tier authenticates by IP/routing, not by an API key —
+    // the identity headers were only for rate-limit pool routing and prompt-cache
+    // affinity. Without them (stripped above) AND without a key, the startup
+    // check `!apiKey && !keyless && !headerExempt` throws "no API key". Setting
+    // keyless: true is the correct signal: this provider genuinely needs no key.
+    p.keyless = true;
+    console.log(`    stripped opencode identity headers from provider: ${name} (marked keyless)`);
+    if (Object.keys(p.headers).length === 0) delete p.headers;
+  }
+}
+scan(merged, "");
+fs.mkdirSync(path.join(stage, "config"), { recursive: true });
+fs.writeFileSync(
+  path.join(stage, "config", "global-config.json"),
+  JSON.stringify(merged, null, 2) + "\n",
+);
+console.log("    keys: " + Object.keys(merged).join(", "));
+if (merged.providers) console.log("    providers: " + Object.keys(merged.providers).join(", "));
+NODE_EOF
+
+echo "==> writing launcher"
+# The launcher derives AIH_HOME from its OWN location, layout-aware:
+#   - offline install  <home>/app/aih  → AIH_HOME = dirname(dirname) = home
+#   - flat tarball     <home>/aih      → AIH_HOME = dirname          = home
+# Installers deploy config.json into that resolved home (offline ps1/sh at
+# %LOCALAPPDATA%\aih|~/.local/share/aih; curl install at INSTALL_DIR), so
+# pinning AIH_HOME here keeps EVERY layout pointing at ITS OWN config.json.
+# An explicit AIH_HOME from the environment still wins.
+cat > "$STAGE/aih" <<'LAUNCHER'
+#!/usr/bin/env node
+import { createRequire } from "node:module";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { basename, dirname, join } from "node:path";
+const __dirname = dirname(fileURLToPath(import.meta.url));
+if (!process.env.AIH_HOME) {
+  // Layout-aware: offline installs live at <home>/app/aih → home = grandparent;
+  // flat tarball installs at <home>/aih → home = this dir. Without this, a
+  // Windows offline install updated via the tarball launcher (no derivation)
+  // loses AIH_HOME and falls back to %USERPROFILE%\.local\share\aih while its
+  // config.json sits in %LOCALAPPDATA%\aih — "config gone, provider reset".
+  process.env.AIH_HOME = basename(__dirname) === "app" ? dirname(__dirname) : __dirname;
+}
+// Point require at our bundled node_modules so deps resolve.
+const require = createRequire(join(__dirname, "node_modules/", "@aih/cli/package.json"));
+// Windows: dynamic import() rejects drive-letter paths ("C:\..." parses as
+// protocol "c:") — convert to a file:// URL first.
+const { main } = await import(pathToFileURL(join(__dirname, "lib/cli/dist/index.js")).href);
+main().catch((err) => {
+  console.error(`✗ ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+});
+LAUNCHER
+chmod +x "$STAGE/aih"
+
+echo "==> sanity: staged tree resolves without network"
+(cd "$STAGE" && node aih --version >/dev/null)
+
+echo "==> embedding installer"
+# Lives OUTSIDE $STAGE so it never leaks into the shipped payloads.
+INNER=$(mktemp)
+cat > "$INNER" <<INNER_EOF
+#!/usr/bin/env sh
+# ============================================================
+# AIH v${VERSION} — offline installer (self-extracting)
+# Everything below the marker line is a gzipped tar payload;
+# installation requires NO network access.
+#
+#   install:    sh \$0
+#   uninstall:  sh \$0 uninstall [--purge-config]
+#
+# Config: the bundled default (merged from the build machine's layers) is
+# deployed to the RESOLVED global dir as config.json — same resolution as aih
+# itself (AIH_HOME > \$XDG_DATA_HOME/aih > ~/.local/share/aih, legacy ~/.aih
+# compat). An existing config.json is NEVER overwritten. Project-level
+# overrides keep working via ./aih.json.
+# ============================================================
+set -eu
+VERSION="${VERSION}"
+MARKER="__PAYLOAD_BELOW__"
+
+fail() { printf '✗ %s\n' "\$*" >&2; exit 1; }
+say()  { printf '==> %s\n' "\$*"; }
+
+app_dir()   { printf '%s' "\${AIH_HOME:-\$HOME/.local/share/aih}/app"; }
+bin_dir()   { printf '%s' "\${AIH_BIN_DIR:-\$HOME/.local/bin}"; }
+link_path() { printf '%s/aih' "\$(bin_dir)"; }
+# Mirror cli/src/paths.ts resolveAihPaths(): AIH_HOME > XDG > default, with
+# legacy ~/.aih kept working when the XDG dir does not exist yet.
+cfg_dir() {
+  _home="\${HOME:-}"
+  if [ -z "\$_home" ]; then _home=\$(cd; pwd); fi
+  if [ -n "\${AIH_HOME:-}" ]; then
+    printf '%s' "\$AIH_HOME"
+  elif [ -n "\${XDG_DATA_HOME:-}" ]; then
+    printf '%s' "\${XDG_DATA_HOME%/}/aih"
+  else
+    printf '%s' "\$_home/.local/share/aih"
+  fi
+}
+extract_to() {
+  _line=\$(grep -an "^\$MARKER\$" "\$0" | head -1 | cut -d: -f1)
+  [ -n "\$_line" ] || fail "payload marker not found — installer file corrupted?"
+  mkdir -p "\$1"
+  tail -n +"\$((_line + 1))" "\$0" | tar -xzf - -C "\$1"
+}
+
+cmd=\${1:-install}
+
+if [ "\$cmd" = "uninstall" ]; then
+  purge=no
+  if [ "\${2:-}" = "--purge-config" ]; then purge=yes; fi
+  say "uninstalling AIH v\$VERSION"
+  APP=\$(app_dir); LINK=\$(link_path)
+  # remove the launcher if it is ours: a symlink pointing into our app dir, or
+  # the node-resolving wrapper script we wrote (bakes APP and execs "\$APP/aih").
+  if [ -L "\$LINK" ]; then
+    TARGET=\$(readlink "\$LINK")
+    case "\$TARGET" in
+      "\$APP"|"\$APP"/*) rm -f "\$LINK"; say "removed \$LINK" ;;
+      *) say "kept \$LINK (points outside \$APP)" ;;
+    esac
+  elif [ -f "\$LINK" ]; then
+    if grep -q "AIH launcher" "\$LINK" 2>/dev/null; then
+      rm -f "\$LINK"; say "removed \$LINK (aih launcher)"
+    else
+      say "kept \$LINK (not an aih launcher)"
+    fi
+  fi
+  # Purge the bundled config copy while the app dir still exists (it lives
+  # under \$APP/config). The deployed global config.json is removed only when
+  # it is byte-identical to what WE deployed — a customized config is kept.
+  if [ "\$purge" = "yes" ]; then
+    CFG="\$(app_dir)/config/global-config.json"
+    if [ -f "\$CFG" ]; then rm -f "\$CFG"; fi
+    CFGDIR=\$(cfg_dir)
+    DEPLOYED="\$CFGDIR/config.json"
+    if [ -f "\$DEPLOYED" ]; then
+      if cmp -s "\$DEPLOYED" "\$(app_dir)/.deployed-config.json" 2>/dev/null; then
+        rm -f "\$DEPLOYED"; say "purged \$DEPLOYED (unmodified since install)"
+      else
+        say "kept \$DEPLOYED (modified since install — remove manually if unwanted)"
+      fi
+    fi
+  fi
+  if [ -d "\$APP" ]; then rm -rf "\$APP"; say "removed \$APP"; fi
+  say "uninstall complete"
+  exit 0
+fi
+
+[ "\$cmd" = "install" ] || fail "usage: sh \$0 [install|uninstall [--purge-config]]"
+
+# --- Node.js resolution (auto-install on demand) --------------------------
+# Prefer a system node >= 20; otherwise download a portable Node.js binary
+# into \$APP/.node and use it, so installs succeed on bare hosts with no node
+# at all. Requires network ONLY for this download step. The bin launcher is a
+# shell wrapper (not a symlink) that resolves node at runtime, so 'aih' keeps
+# working even after the system node disappears or PATH changes.
+NODE_VERSION="${AIH_NODE_VERSION:-v22.14.0}"
+NODE_DIR="\$(app_dir)/.node"
+NODE_BIN=""
+if command -v node >/dev/null 2>&1; then
+  NMAJOR=\$(node -p 'parseInt(process.versions.node.split(".")[0], 10)' 2>/dev/null || echo 0)
+  [ "\$NMAJOR" -ge 20 ] && NODE_BIN="\$(command -v node)"
+fi
+OS="linux"; [ "\$(uname -s)" = "Darwin" ] && OS="darwin"
+ARCH="x64";  [ "\$(uname -m)" = "aarch64" ] && ARCH="arm64"
+# Reuse a previously downloaded portable Node.js instead of re-downloading:
+# offline re-installs land on the same node version and must not hit the
+# network again. Verify it still runs; if broken, fall through to download.
+if [ -z "\$NODE_BIN" ]; then
+  CACHED="\$NODE_DIR/node-\$NODE_VERSION-\$OS-\$ARCH/bin/node"
+  if [ -x "\$CACHED" ]; then
+    if CACHED_VER="\$("\$CACHED" --version 2>/dev/null)"; then
+      say "reusing cached Node.js \$CACHED_VER from \$NODE_DIR"
+      NODE_BIN="\$CACHED"
+    fi
+  fi
+fi
+if [ -z "\$NODE_BIN" ]; then
+  say "no usable Node.js (need >= 20) — downloading \$NODE_VERSION (\$OS-\$ARCH) into \$NODE_DIR"
+  mkdir -p "\$NODE_DIR"
+  URL="https://nodejs.org/dist/\$NODE_VERSION/node-\$NODE_VERSION-\$OS-\$ARCH.tar.gz"
+  TMPTAR="\$NODE_DIR/node.tar.gz"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "\$URL" -o "\$TMPTAR" || fail "failed to download Node.js from \$URL"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "\$URL" -O "\$TMPTAR" || fail "failed to download Node.js from \$URL"
+  else
+    fail "no curl or wget — install Node.js >= 20 manually, or install curl/wget"
+  fi
+  tar -xzf "\$TMPTAR" -C "\$NODE_DIR" || fail "failed to extract Node.js from \$TMPTAR"
+  rm -f "\$TMPTAR"
+  NODE_BIN="\$NODE_DIR/node-\$NODE_VERSION-\$OS-\$ARCH/bin/node"
+  [ -x "\$NODE_BIN" ] || fail "downloaded Node.js binary not found at \$NODE_BIN"
+  say "using downloaded Node.js \$( "\$NODE_BIN" --version)"
+fi
+
+TMP=\$(mktemp -d)
+trap 'rm -rf "\$TMP"' EXIT
+say "extracting payload"
+extract_to "\$TMP"
+
+APP=\$(app_dir)
+mkdir -p "\$APP"
+cp -a "\$TMP/." "\$APP/"
+say "installed app files to \$APP"
+
+BIN=\$(bin_dir)
+mkdir -p "\$BIN"
+# The launcher is a shell wrapper that resolves node at runtime: bundled
+# portable node (\$APP/.node) wins, then system node. Writing a wrapper instead
+# of symlinking keeps 'aih' working when the system node is missing entirely
+# or PATH changes after install. APP is baked in at install time (bin dir may
+# be a different tree from the app dir, e.g. ~/.local/bin vs ~/.local/share/aih/app).
+APP_BAKED="\$APP"
+NODE_VERSION_BAKED="\$NODE_VERSION"
+OS_BAKED="\$OS"
+ARCH_BAKED="\$ARCH"
+cat > "\$BIN/aih" <<'LAUNCHER'
+#!/bin/sh
+# AIH launcher — resolves Node.js: bundled portable binary, then system.
+APP="APP_BAKED"
+NODE_BIN="\$APP/.node/node-NODE_VERSION_BAKED-OS_BAKED-ARCH_BAKED/bin/node"
+[ -x "\$NODE_BIN" ] || NODE_BIN="\$(command -v node 2>/dev/null || true)"
+if [ -z "\$NODE_BIN" ]; then
+  printf '✗ node not found — AIH needs Node.js >= 20 (reinstall to auto-download it)\n' >&2
+  exit 1
+fi
+export AIH_NODE_BIN="\$NODE_BIN"
+exec "\$NODE_BIN" "\$APP/lib/cli/dist/index.js" "\$@"
+LAUNCHER
+sed -i "s|APP_BAKED|\$APP_BAKED|g; s|NODE_VERSION_BAKED|\$NODE_VERSION_BAKED|g; s|OS_BAKED|\$OS_BAKED|g; s|ARCH_BAKED|\$ARCH_BAKED|g" "\$BIN/aih"
+chmod +x "\$BIN/aih"
+say "wrote \$BIN/aih (node-resolving launcher)"
+
+case ":\$PATH:" in
+  *":\$BIN:"*) ;;
+  *) printf '! %s is not in PATH — add: export PATH="%s:\$PATH"\n' "\$BIN" "\$BIN" ;;
+esac
+
+# Deploy the merged default to the RESOLVED global dir (never overwrite).
+CFGDIR=\$(cfg_dir)
+mkdir -p "\$CFGDIR"
+cp "\$APP/config/global-config.json" "\$APP/.deployed-config.json"
+if [ -f "\$CFGDIR/config.json" ]; then
+  say "kept existing \$CFGDIR/config.json (bundled default at \$APP/config/)"
+else
+  cp "\$APP/config/global-config.json" "\$CFGDIR/config.json"
+  say "deployed default config to \$CFGDIR/config.json"
+fi
+
+say "verifying"
+"\$BIN/aih" --version >/dev/null || fail "post-install verification failed"
+printf '\n✔ AIH v%s installed.\n' "\$VERSION"
+printf '  try:  %s chat\n' "\$BIN/aih"
+exit 0
+INNER_EOF
+
+mkdir -p "$OUT_DIR"
+OFFLINE="$OUT_DIR/aih-$VERSION-offline.sh"
+OFFLINE_PS1="$OUT_DIR/aih-$VERSION-offline.ps1"
+# Absolute: the sanity block cd's into its sandbox HOME before running it.
+OFFLINE="$(cd "$(dirname "$OFFLINE")" && pwd)/$(basename "$OFFLINE")"
+
+echo "==> packing payload"
+PAYLOAD_TGZ=$(mktemp)
+tar -czf "$PAYLOAD_TGZ" -C "$STAGE" .
+{
+  cat "$INNER"
+  printf '\n%s\n' "__PAYLOAD_BELOW__"
+  cat "$PAYLOAD_TGZ"
+} > "$OFFLINE"
+
+echo "==> building Windows installer (.ps1)"
+# Same payload, base64-embedded (keeps the .ps1 pure text). Extraction uses the
+# built-in tar.exe (Windows 10 1803+). No symlinks: the staged tree ships real
+# copies under node_modules/@aih, so nothing needs admin rights.
+STAGE_WIN=$(mktemp -d)
+cp -a "$STAGE/." "$STAGE_WIN/"
+rm "$STAGE_WIN/node_modules/@aih/core" "$STAGE_WIN/node_modules/@aih/cli" "$STAGE_WIN/node_modules/@aih/mcp-server"
+for ws in core cli mcp-server; do
+  cp -a "$STAGE/lib/$ws" "$STAGE_WIN/node_modules/@aih/$ws"
+done
+PAYLOAD_TGZ_WIN=$(mktemp)
+tar -czf "$PAYLOAD_TGZ_WIN" -C "$STAGE_WIN" .
+
+# The payload is appended AFTER the script body (after a marker line).
+# PowerShell's parser stops at the first `exit`/end-of-script, so the raw
+# base64 data below the marker is NEVER parsed as code — this avoids the
+# PS 5.1 stack/buffer overflow that a multi-MB here-string triggers.
+cat > "$OFFLINE_PS1" <<'PS_EOF'
+#Requires -Version 5.1
+# ============================================================
+# AIH v__VERSION__ - offline installer for Windows (self-extracting)
+# The payload is embedded as a base64 here-string below; installation
+# requires NO network access. Single-file: just run this .ps1.
+#
+#   install:    powershell -ep Bypass -File aih-*-offline.ps1
+#   uninstall:  powershell -File aih-*-offline.ps1 uninstall [-PurgeConfig]
+#
+# Overrides:  -AppDir <path>  -BinDir <path>
+#   defaults: %LOCALAPPDATA%\aih\app / %LOCALAPPDATA%\aih
+#
+# Config: the bundled default is deployed next to the app dir (or to %AIH_HOME%
+# when set) as config.json - never overwriting an existing one. The launcher
+# derives AIH_HOME from its own location at runtime, so install and run always
+# agree. Project-level overrides keep working via .\aih.json.
+# ============================================================
+param(
+  [Parameter(Position = 0)][string]$Action = "install",
+  [switch]$PurgeConfig,
+  [string]$AppDir,
+  [string]$BinDir
+)
+
+$ErrorActionPreference = "Stop"
+$Version = "__VERSION__"
+
+# Mirror the LAUNCHER's runtime derivation (it sets AIH_HOME to its own
+# grand-parent dir unless the env var is already set): the deployed
+# config.json must land exactly there, or aih cannot find it at runtime.
+function GlobalConfigDir {
+  if ($env:AIH_HOME) { return $env:AIH_HOME }
+  return Split-Path $AppDir -Parent
+}
+
+# ---- self-extracting payload: base64(gzip(tar)) here-string --------------
+# The payload is embedded as a base64 here-string ($PayloadB64). PS 5.1's
+# parser handles here-strings correctly (they are syntactically inert); the
+# "buffer overflow" the user saw was a RUNTIME crash in node/conhost, not a
+# parser failure. Single-file keeps the install UX simple.
+$PayloadB64 = ""
+
+function Fail([string]$m) { Write-Host ("[x] " + $m); exit 1 }
+function Say([string]$m)  { Write-Host ("==> " + $m) }
+
+if (-not $AppDir)    { $AppDir    = Join-Path $env:LOCALAPPDATA "aih\app" }
+if (-not $BinDir)    { $BinDir    = Split-Path $AppDir -Parent }
+
+if ($Action -eq "uninstall") {
+  Say ("uninstalling AIH v" + $Version)
+  $link = Join-Path $BinDir "aih.cmd"
+  if (Test-Path $link) { Remove-Item $link -Force; Say ("removed " + $link) }
+  # The deployed global config.json is removed only when it is byte-identical
+  # to what WE deployed (fingerprint saved at install time) - a customized
+  # config is kept and must be removed manually.
+  if (Test-Path $AppDir) {
+    if ($PurgeConfig) {
+      $bundled = Join-Path $AppDir "config\global-config.json"
+      if (Test-Path $bundled) { Remove-Item $bundled -Force }
+      $deployed = Join-Path (GlobalConfigDir) "config.json"
+      $fingerprint = Join-Path $AppDir ".deployed-config.json"
+      if ((Test-Path $deployed) -and (Test-Path $fingerprint)) {
+        if ((Get-FileHash $deployed).Hash -eq (Get-FileHash $fingerprint).Hash) {
+          Remove-Item $deployed -Force; Say ("purged " + $deployed + " (unmodified since install)")
+        } else {
+          Say ("kept " + $deployed + " (modified since install - remove manually if unwanted)")
+        }
+      }
+    }
+    Remove-Item $AppDir -Recurse -Force
+    Say ("removed " + $AppDir)
+  }
+  Say "uninstall complete"
+  exit 0
+}
+
+if ($Action -ne "install") {
+  Fail "usage: powershell -File this-script [install | uninstall [-PurgeConfig]] [-AppDir path] [-BinDir path]"
+}
+
+# --- Node.js resolution (auto-install on demand) --------------------------
+# Prefer a system node >= 20; otherwise download a portable Node.js binary
+# into $AppDir\.node and use it. The .cmd shim bakes the resolved node path,
+# so 'aih' keeps working even after the system node disappears or PATH changes.
+$NodeVersion = if ($env:AIH_NODE_VERSION) { $env:AIH_NODE_VERSION } else { "v22.14.0" }
+$NodeResolved = ""
+$node = Get-Command node -ErrorAction SilentlyContinue
+if ($node) {
+  $nMajor = [int](& node -p "parseInt(process.versions.node.split('.')[0], 10)" 2>$null)
+  if ($nMajor -ge 20) { $NodeResolved = "node" }
+}
+if (-not $NodeResolved) {
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+  $nodeDir = Join-Path $AppDir ".node"
+  New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
+  # Reuse a previously downloaded portable Node.js instead of re-downloading:
+  # offline re-installs land on the same node version and must not hit the
+  # network again. Verify it still runs; if broken, fall through to download.
+  $cachedNode = Join-Path $nodeDir ("node-" + $NodeVersion + "-win-" + $arch + "\node.exe")
+  if (Test-Path $cachedNode) {
+    try {
+      $cachedVer = & $cachedNode --version 2>$null
+      if ($LASTEXITCODE -eq 0 -and $cachedVer) {
+        $NodeResolved = $cachedNode
+        Say ("reusing cached Node.js " + $cachedVer + " from " + $nodeDir)
+      }
+    } catch { /* fall through to download */ }
+  }
+}
+if (-not $NodeResolved) {
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+  $nodeDir = Join-Path $AppDir ".node"
+  New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
+  $zip = Join-Path $nodeDir "node.zip"
+  $url = "https://nodejs.org/dist/$NodeVersion/node-$NodeVersion-win-$arch.zip"
+  Say ("no usable Node.js (need >= 20) - downloading " + $NodeVersion + " (" + $arch + ") into " + $nodeDir)
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+  } catch {
+    Fail ("failed to download Node.js from " + $url + " - install Node.js >= 20 manually")
+  }
+  try {
+    Expand-Archive -Path $zip -DestinationPath $nodeDir -Force
+  } catch {
+    Fail ("failed to extract Node.js zip at " + $zip)
+  }
+  Remove-Item $zip -Force
+  $NodeResolved = Join-Path $nodeDir ("node-" + $NodeVersion + "-win-" + $arch + "\node.exe")
+  if (-not (Test-Path $NodeResolved)) { Fail ("downloaded Node.js not found at " + $NodeResolved) }
+  Say ("using downloaded Node.js " + (& $NodeResolved --version))
+}
+
+Say "extracting payload"
+$b64 = [string]::Join("", ($PayloadB64 -split "\r?\n"))
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("aih-" + [System.IO.Path]::GetRandomFileName())
+New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+
+try {
+  $tgzPath = Join-Path $tmp "payload.tgz"
+  [System.IO.File]::WriteAllBytes($tgzPath, [Convert]::FromBase64String($b64))
+  & tar -xzf $tgzPath -C $tmp
+  if ($LASTEXITCODE -ne 0) { Fail "payload extraction failed (built-in tar.exe requires Windows 10 1803+)" }
+
+  Say ("installing app files to " + $AppDir)
+  New-Item -ItemType Directory -Path $AppDir -Force | Out-Null
+  Copy-Item (Join-Path $tmp "*") $AppDir -Recurse -Force
+
+  New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
+  $shim = Join-Path $BinDir "aih.cmd"
+  # Bake the install-time AIH_HOME into the shim so runtime config resolution
+  # (paths.ts) finds the config.json this installer deployed.
+  $cfgHome = if ($env:AIH_HOME) { $env:AIH_HOME } else { "" }
+  $shimLines = "@echo off`r`n"
+  if ($cfgHome) { $shimLines += "set AIH_HOME=$cfgHome`r`n" }
+  if ($NodeResolved -ne "node") {
+    # Downloaded portable node: bake its absolute path so the shim works even
+    # when node is absent from PATH.
+    $shimLines += ("set AIH_NODE_BIN=`"" + $NodeResolved + "`"`r`n")
+  }
+  $shimLines += "if defined AIH_NODE_BIN (set _NODE=%AIH_NODE_BIN%) else (set _NODE=node)`r`n"
+  $shimLines += "`"%_NODE%`" `"" + (Join-Path $AppDir "aih") + "`" %*`r`n"
+  # If node crashes, pause so the window doesn't vanish before WER / error is read.
+  $shimLines += "if errorlevel 1 (`r`necho.`r`necho [aih] exited with code %errorlevel% — see above for details`r`npause`r`n)`r`n"
+  Set-Content -Path $shim -Value $shimLines
+  Say ("wrote " + $shim)
+
+  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  if ((($userPath -split ";") -notcontains $BinDir)) {
+    Write-Host ("! " + $BinDir + " is not in your user PATH - add it to use 'aih' from anywhere")
+  }
+
+  # Deploy the merged default to the RESOLVED global dir (never overwrite).
+  $cfgDir = GlobalConfigDir
+  New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null
+  Copy-Item (Join-Path $AppDir "config\global-config.json") (Join-Path $AppDir ".deployed-config.json") -Force
+  $cfgTarget = Join-Path $cfgDir "config.json"
+  if (Test-Path $cfgTarget) {
+    Say ("kept existing " + $cfgTarget + " (bundled default at " + (Join-Path $AppDir "config") + ")")
+  } else {
+    Copy-Item (Join-Path $AppDir "config\global-config.json") $cfgTarget
+    Say ("deployed default config to " + $cfgTarget)
+  }
+
+  Say "verifying"
+  # verify via node directly (works cross-platform; the .cmd shim is a thin forwarder)
+  & $NodeResolved (Join-Path $AppDir "aih") --version | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail "post-install verification failed" }
+  Write-Host ""
+  Write-Host ("OK: AIH v" + $Version + " installed.")
+  Write-Host ("  try:  " + $shim + " chat")
+} finally {
+  Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+exit 0
+PS_EOF
+
+# Embed the payload as a base64 here-string INSIDE the ps1 (single-file).
+# The here-string is syntactically inert — PS parser handles it correctly.
+# The template has `$PayloadB64 = ""` which we replace with the real block.
+cat "$PAYLOAD_TGZ_WIN" | base64 -w 76 > /tmp/_payload_b64.txt
+{
+  echo '$PayloadB64 = @"'
+  cat /tmp/_payload_b64.txt
+  echo '"@'
+} > /tmp/_payload_block.txt
+rm /tmp/_payload_b64.txt
+
+# Replace the single-line placeholder with the multi-line here-string.
+# awk is more reliable than sed for multi-line insertion.
+awk -v blockfile=/tmp/_payload_block.txt '
+  /^\$PayloadB64 = ""$/ { while ((getline line < blockfile) > 0) print line; next }
+  { print }
+' "$OFFLINE_PS1" > /tmp/_ps1_new && mv /tmp/_ps1_new "$OFFLINE_PS1"
+rm /tmp/_payload_block.txt
+
+sed -i "s/__VERSION__/$VERSION/g" "$OFFLINE_PS1"
+
+echo "==> sanity: .ps1 payload round-trips byte-for-byte"
+awk '/^\$PayloadB64 = @"$/{f=1;next} /^"@$/{f=0} f' "$OFFLINE_PS1" | tr -d '\r\n' | base64 -d | cmp -s - "$PAYLOAD_TGZ_WIN" \
+  || { echo "error: ps1 payload round-trip mismatch" >&2; exit 1; }
+echo "    payload verified"
+rm -rf "$STAGE_WIN"
+
+rm -f "$PAYLOAD_TGZ" "$PAYLOAD_TGZ_WIN"
+
+echo "==> sanity: offline installer installs & uninstalls (sandboxed)"
+TEST_HOME=$(mktemp -d)
+(
+  export HOME="$TEST_HOME"
+  cd "$TEST_HOME"
+  sh "$OFFLINE" >/dev/null
+  "$TEST_HOME/.local/bin/aih" --version >/dev/null
+  [ -f "$TEST_HOME/.local/share/aih/app/config/global-config.json" ]
+  [ -f "$TEST_HOME/.local/share/aih/config.json" ]
+  # purge: unmodified deployed config is removed with the app
+  sh "$OFFLINE" uninstall --purge-config >/dev/null
+  [ ! -e "$TEST_HOME/.local/share/aih/app" ]
+  [ ! -e "$TEST_HOME/.local/bin/aih" ]
+  [ ! -e "$TEST_HOME/.local/share/aih/config.json" ]
+)
+rm -rf "$TEST_HOME"
+
+echo "==> packaged $OFFLINE ($(du -h "$OFFLINE" | cut -f1))"
+echo "==> packaged $OFFLINE_PS1 ($(du -h "$OFFLINE_PS1" | cut -f1))"
+rm -f "$INNER"
