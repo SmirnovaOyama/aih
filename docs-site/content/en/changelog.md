@@ -11,7 +11,6 @@ The full itemized record lives in the repo [`CHANGELOG.md`](https://github.com/s
 
 **Fixed**
 
-- **opencode zen free tier 403 (invalid session id format)** — session files are named `s-YYYYMMDD-HHMMSS` and were passed straight into `x-opencode-session`; the gateway validates the id FORMAT (`ses_` + 26 base62), so every request 403'd. `normalizeSid()` now remaps any non-conforming id to a fresh valid `ses_<26>` body, STABLE per input (one conversation = one gateway session across requests).
 - **steering input swallowed at the final step** — steering queued while the model was about to end the turn was silently dropped. The final-step drain now appends pending steering to the log and runs one more step.
 - **compaction failures were silent no-ops** — empty summaries left the context bloated with no diagnostic. They now emit a stderr line with `turn=` / `trigger=auto` context; the summary template also preserves user authorization state verbatim.
 

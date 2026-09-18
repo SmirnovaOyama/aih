@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { PermissionRule } from "@aih/core";
+import type { PermissionRule, JsonSchemaProperty } from "@aih/core";
 import { checkSchemaVersion, CONFIG_SCHEMA_VERSION, stampConfigVersion } from "@aih/core";
 import type { Policy } from "./policies.js";
 import { loadPolicies, providerAllowed } from "./policies.js";
@@ -65,6 +65,23 @@ export interface ProviderConfig {
   maxTokens?: number;
   /** extra request headers for this provider (e.g. client identity for rate-limit pools) */
   headers?: Record<string, string>;
+  /**
+   * Extra OpenAI-format tools appended to the request body's `tools` array
+   * (in addition to AIH's own tools, deduped by name). For gateways that
+   * fingerprint the client tool set. Stubs only; they are NOT callable AIH tools.
+   */
+  extraTools?: Array<{
+    type: "function";
+    function: {
+      name: string;
+      description: string;
+      parameters: {
+        type: "object";
+        properties: Record<string, JsonSchemaProperty>;
+        required: string[];
+      };
+    };
+  }>;
 }
 
 /** F#34 — object form of one `providers.<name>.models[]` entry. */
@@ -201,6 +218,18 @@ export interface ResolvedLlm {
   maxTokens?: number;
   contextWindow: ResolvedValue;
   headers: Record<string, string>;
+  extraTools?: Array<{
+    type: "function";
+    function: {
+      name: string;
+      description: string;
+      parameters: {
+        type: "object";
+        properties: Record<string, JsonSchemaProperty>;
+        required: string[];
+      };
+    };
+  }>;
   layers: ConfigLayer[];
 }
 
@@ -787,5 +816,16 @@ export function resolveLlm(opts: {  flagModel?: string;
                 c.contextWindow !== undefined ? String(c.contextWindow) : undefined,
             );
 
-  return { model, baseUrl, apiKeyEnv, provider: providerName, keyless, maxTokens, headers, contextWindow, layers };
+  // extraTools: last layer that declares a non-empty array wins (no merge —
+  // it is an explicit per-provider client-fingerprint stub set).
+  let extraTools: NonNullable<AihConfig["providers"]>[string]["extraTools"];
+  for (let i = layers.length - 1; i >= 0; i--) {
+    const p = layers[i].config.providers?.[providerName ?? ""];
+    if (p?.extraTools && p.extraTools.length > 0) {
+      extraTools = p.extraTools;
+      break;
+    }
+  }
+
+  return { model, baseUrl, apiKeyEnv, provider: providerName, keyless, maxTokens, headers, extraTools, contextWindow, layers };
 }

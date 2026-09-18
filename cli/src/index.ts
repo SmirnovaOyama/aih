@@ -734,6 +734,7 @@ function buildRealLlm(flags: Record<string, string | boolean>, sessionId?: strin
     ...(resolved.maxTokens !== undefined ? { maxTokens: resolved.maxTokens } : {}),
     ...(retries !== undefined ? { retries } : {}),
     ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    ...(resolved.extraTools && resolved.extraTools.length > 0 ? { extraTools: resolved.extraTools } : {}),
     ...(sessionId ? { sessionId } : {}),
     // OC#7 — credential ownership isolation: a credential failure on this
     // provider degrades ITS OWNER (recorded for `aih models`/doctor/status);

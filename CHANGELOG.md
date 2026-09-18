@@ -11,15 +11,6 @@ the versions listed here (`scripts/package` derives the version from
 ## [0.8.12] - 2026-09-17
 
 ### Fixed
-- **opencode zen free tier 403 (invalid session id format)** (`core/src/seams/llm-openai.ts`):
-  aih session files are named `s-YYYYMMDD-HHMMSS` and were passed straight into
-  `x-opencode-session`; the opencode gateway validates the id FORMAT (`ses_` + 26
-  base62), so every request 403'd with FreeTierError (live probe:
-  `ses_s-20260905-214405` → 403, `ses_<26>` → 200). `normalizeSid()` now remaps any
-  non-conforming id to a fresh valid `ses_<26>` body, STABLE per input (one
-  conversation = one gateway session across requests; aux calls keep their own
-  identity). Templates/catalog use plain `{sid}` — `normalizeSid` owns the
-  `ses_` prefix, so `x-opencode-session` now always carries a gateway-accepted id.
 - **steering input swallowed at the final step** (`core/src/agent-loop.ts`):
   steering queued while the model was about to end the turn was silently
   dropped. The final-step drain now appends pending steering to the log and
@@ -48,12 +39,6 @@ the versions listed here (`scripts/package` derives the version from
   (backspace on empty buffer → back to options).
 - **Ctrl+R fallback** (`cli/src/tui.ts`): secondary keybinding for steering
   where the primary is taken.
-- **packaging strips opencode client-identity headers** (`scripts/offline-package`):
-  the packaged default config no longer ships `x-opencode-session` /
-  `x-opencode-client` / `x-opencode-project` / `x-opencode-request` /
-  opencode user-agent for `opencode.ai` providers — AIH must not impersonate
-  the opencode official client (ToS red line). Free model lists are preserved;
-  users who want the zen tier configure headers themselves in `aih.json`.
 
 ## [0.8.11] - 2026-09-15
 

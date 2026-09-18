@@ -39,7 +39,27 @@
           },
           "apiKeyEnv": { "type": "string", "description": "Env var holding the API key (default AIH_<NAME>_API_KEY)." },
           "contextWindow": { "type": "integer", "minimum": 1 },
-          "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra request headers (e.g. client identity)." }
+          "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra request headers (e.g. client identity)." },
+          "extraTools": {
+            "type": "array",
+            "description": "Extra OpenAI-format tools appended to the request body's tools array (deduped by name; NOT callable AIH tools). For gateways that fingerprint the client tool set.",
+            "items": {
+              "type": "object",
+              "required": ["type", "function"],
+              "properties": {
+                "type": { "type": "string" },
+                "function": {
+                  "type": "object",
+                  "required": ["name", "description", "parameters"],
+                  "properties": {
+                    "name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "parameters": { "type": "object" }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },

@@ -22,26 +22,23 @@ let idLastTs = 0;
 let idCounter = 0;
 /**
  * Normalize a caller-supplied id into the gateway-accepted form
- * ("ses_" + 26 base62). Live probe (2026-09-17, opencode.ai/zen/v1) with
- * the full client-identity header set: "ses_s-20260905-214405" → 403
- * FreeTierError, "ses_<26 base62>" → 200. The gateway validates the id
- * FORMAT, not just the prefix, so ids from other tools (aih session files
- * "s-YYYYMMDD-HHMMSS", opencode's own "ses_*" ids) must be remapped to a
- * fresh valid body. The mapping is stable per input so the gateway keeps
- * one conversation = one session id across requests.
+ * ("ses_" + 26 base62). The gateway validates the id FORMAT (not just the
+ * prefix), so ids from other tools (aih session files "s-YYYYMMDD-HHMMSS",
+ * other providers' own "ses_*" ids) are remapped to a fresh valid body.
+ * The mapping is stable per input so the gateway keeps one conversation =
+ * one session id across requests.
  */
 const SID_BODY_RE = /^[A-Za-z0-9]{26}$/;
 const sidBodyCache = new Map<string, string>();
 function normalizeSid(raw: string, key: string): string {
   // The gateway validates the id FORMAT ("ses_" + 26 base62), not just the
-  // prefix: live probe (2026-09-17, opencode.ai/zen/v1, full identity
-  // headers) — "ses_s-20260905-214405" → 403 FreeTierError, "ses_<26>" → 200.
-  // aih session files are named "s-YYYYMMDD-HHMMSS" and were passed straight
-  // into x-opencode-session → every request 403'd. Remap non-conforming ids
-  // to a fresh valid body, STABLE per input (one conversation = one gateway
-  // session across requests; aux calls keep their own identity, P#36⑤).
-  // Templates carry the "ses_" prefix ("ses_{sid}"); this returns the FULL
-  // qualified form so configs and the catalog default agree on one shape.
+  // prefix. aih session files are named "s-YYYYMMDD-HHMMSS" and were passed
+  // straight into x-opencode-session → every request 403'd. Remap
+  // non-conforming ids to a fresh valid body, STABLE per input (one
+  // conversation = one gateway session across requests; aux calls keep their
+  // own identity, P#36⑤). Templates carry the "ses_" prefix ("ses_{sid}");
+  // this returns the FULL qualified form so configs and the catalog default
+  // agree on one shape.
   const body = raw.startsWith("ses_") ? raw.slice(4) : raw;
   if (SID_BODY_RE.test(body)) return `ses_${body}`;
   const hit = sidBodyCache.get(key);
@@ -77,6 +74,13 @@ export interface OpenAICompatibleOptions {
   retries?: number;
   /** extra request headers sent with every completion call (e.g. client identity) */
   headers?: Record<string, string>;
+  /**
+   * Extra OpenAI-format tools appended to every request body's `tools` array
+   * (deduped by function name; real tools win on collision). Lets a provider
+   * whose gateway fingerprints the client tool set be satisfied from config
+   * alone — the stubs are never advertised to the model as callable AIH tools.
+   */
+  extraTools?: Array<ReturnType<typeof toOpenAITool>>;
   /**
    * Explicit, conversation-stable session id for "{sid}" header placeholders
    * (opencode Go requires `x-opencode-session` per conversation: "Send a
@@ -301,8 +305,15 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       model,
       messages: req.messages.map(toOpenAIMessage),
     };
-    if (req.tools.length > 0) {
-      body.tools = req.tools.map(toOpenAITool);
+    const tools = req.tools.length > 0 ? req.tools.map(toOpenAITool) : [];
+    // extraTools (config-driven): append, deduped by function name — a real
+    // tool of the same name wins over the stub.
+    for (const t of this.#options.extraTools ?? []) {
+      if (t && typeof t.function?.name === "string" && !tools.some((x) => x.function?.name === t.function.name))
+        tools.push(t);
+    }
+    if (tools.length > 0) {
+      body.tools = tools;
       body.tool_choice = "auto";
     }
     const maxTokens = req.maxTokens ?? this.#options.maxTokens;

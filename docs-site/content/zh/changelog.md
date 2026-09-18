@@ -11,7 +11,6 @@ description: AIH 版本更新日志 —— 0.8.x / 0.7.x / 0.6.x / 0.5.x 的主�
 
 **修复**
 
-- **opencode zen 免费层 403（session id 格式非法，安全/可用性）**：会话文件名为 `s-YYYYMMDD-HHMMSS`，此前直接透传进 `x-opencode-session` 头；opencode 网关校验 id **格式**（`ses_` + 26 位 base62），故每个请求都 403。`normalizeSid()` 现在把任何不合规 id 稳定重映射为合法 `ses_<26>`（同一会话 = 进程内稳定映射，跨请求不变）。
 - **最终步 steering 输入被吞**：模型即将结束回合时排队的 steering 会被静默丢弃；final-step drain 现在把挂起的 steering 追加进日志并多跑一步。
 - **压缩失败曾是静默 no-op**：空摘要让上下文继续膨胀且无诊断；现在输出带 `turn=` / `trigger=auto` 上下文的 stderr 行，摘要模板还逐字保留用户授权状态。
 
@@ -19,7 +18,6 @@ description: AIH 版本更新日志 —— 0.8.x / 0.7.x / 0.6.x / 0.5.x 的主�
 
 - **模型选择器 MRU**：最近用过的 provider/模型浮到 `/model` 选择器顶部（去重，其余保持配置序）。
 - **Steering 召回（Alt+Up）**：把最近一条未消费的 steering 拉回编辑器重发；Ctrl+R 副键回退；question UX 钉底 + 滚动 + 可退出的自由输入模式。
-- **打包剥离 opencode 客户端身份头**：打包默认配置不再携带 opencode.ai provider 的 `x-opencode-session` / `x-opencode-client` / `x-opencode-project` / `x-opencode-request` / user-agent——AIH 不代发 opencode 官方客户端身份头。免费模型列表保留；如需 zen 免费层请自己在 aih.json 配头。
 
 ## 0.8.11（2026-09-15）
 

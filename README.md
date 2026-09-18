@@ -1049,6 +1049,26 @@ extra switchable models under the same endpoint (sharing that provider's `baseUr
 `ctrl-p` model picker — hot-switch with `/model <provider>/<model>` or by selecting
 directly. Great for hanging free-tier / multi-tier models off one endpoint.
 
+**Extra tools in the request body (`extraTools`)**: some gateways fingerprint the
+client by the `tools` array in the request body. `providers.<name>.extraTools`
+appends OpenAI-format tool stubs to every request's `tools` array (deduped by
+function name — a real AIH tool of the same name wins). The stubs are **not**
+registered as callable AIH tools: if a model ever calls one, it gets a clean
+`unknown tool: <name>` result and recovers.
+
+```json
+{
+  "providers": {
+    "example": {
+      "baseUrl": "https://example.com/v1",
+      "extraTools": [
+        { "type": "function", "function": { "name": "my_tool", "description": "A stub tool for the gateway.", "parameters": { "type": "object", "properties": {}, "required": [] } } }
+      ]
+    }
+  }
+}
+```
+
 ### Rules (`AGENTS.md` / `CLAUDE.md` / `instructions` — opencode `rules` parity)
 
 AIH reads and injects project/global rule files as **mandatory instructions**
