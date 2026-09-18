@@ -7,6 +7,17 @@ description: AIH release notes — key changes in 0.8.x / 0.7.x / 0.6.x / 0.5.x.
 
 The full itemized record lives in the repo [`CHANGELOG.md`](https://github.com/summit4you/aih/blob/main/CHANGELOG.md) (Keep a Changelog format, SemVer). This page is a per-version summary.
 
+## 0.8.13 (2026-09-18)
+
+**Fixed**
+
+- **stale todo list across sessions** — the sidebar todo list leaked from the previous session via the project-level `.aih/todos.json`; fresh sessions now start clean (resume via `--session`/`-c` and in-session `/restore` rollback keep the list as before).
+- **sidebar text padding walked after repaint** — ▶/⚙/↩ are 1-cell glyphs in zh_CN CJK fonts though standard string-width counts 2; width model corrected (`❓` stays 2 — real emoji), todo rows use a fixed 2-col prefix so every status aligns with its wrapped lines.
+- **minimize→maximize froze the UI for seconds** — window-animation resize bursts collapsed into one final repaint (debounce 16ms → 160ms; each intermediate size used to pay a full cold re-render).
+- **minimize→maximize no longer stuck to the last message** — a pinned viewport is re-followed after the rows/cols refresh; the last message stays on the last line after growing the window.
+- **sidebar background crept left after minimize→maximize** — the frame now keeps the final terminal column unwritten (DECAWM pending-wrap guard), so edge-column drift no longer shortens the sidebar gutter.
+- **`?` could not be typed at position 0** — the help dialog now replays the `?` into the composer when it closes (`/help`/palette unaffected).
+
 ## 0.8.12 (2026-09-17)
 
 **Fixed**
