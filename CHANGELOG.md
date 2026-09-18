@@ -8,6 +8,47 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.13] - 2026-09-18
+
+### Fixed
+- **stale todo list across sessions** (`cli/src/index.ts`, `cli/src/serve.ts`):
+  the sidebar todo panel reads the project-level `.aih/todos.json`, which
+  survived at exit and leaked the previous session's list into every NEW
+  session. A fresh-session launch now clears the file (resume via
+  `--session`/`-c`, in-session `/restore` rollback keeps it — same session
+  scope as the P#37② snapshot). Regression-tested.
+- **sidebar text padding walked after repaint** (`cli/src/tui.ts`): the todo
+  icon prefix mixed widths — ▶ (U+25B6) is rendered one cell wide by the
+  zh_CN CJK fonts although standard string-width counts it as 2 (emoji). The
+  family is now corrected in `WIDTH_OVERRIDES` (▶ ⚠ ⚙ ↩ → 1 cell; ❓ stays 2 —
+  it is Emoji_Presentation and rendering 2 everywhere), and todo first lines
+  carry a fixed 2-column prefix so every status aligns with its wrapped
+  continuation lines. Added the R8-1b alignment smoke assertions.
+- **minimize→maximize froze the UI for seconds** (`cli/src/tui.ts`): window
+  animations fire resize events per intermediate size; each event invalidated
+  every item cache (width changed) and paid a full cold re-render (~150ms at
+  10k items, 16ms debounce did not merge the burst). The resize handler now
+  debounces at animation scale (160ms, 400ms legacy conhost) so a burst
+  collapses into ONE final paint.
+- **minimize→maximize no longer stuck to the last message** (`cli/src/tui.ts`):
+  the resize handler only forced a full repaint; a pinned viewport was not
+  re-followed (the paint-time clamp only pulls DOWN an out-of-range scrollTop).
+  The handler now refreshes `#rows`/`#cols` FIRST, then re-follows the bottom
+  when pinned — growing the window keeps the last message on the last line.
+  Shrinking drifts and unpinned history browsing are unaffected.
+- **sidebar background block crept left after minimize→maximize**:
+  the frame is now (width-1) cells wide — the panel column anchors one cell
+  earlier and the final terminal column is never written, so the cursor never
+  rides the DECAWM pending-wrap boundary (edge-column drift on several
+  terminal families shortened the 4-col gutter; user-probe showed the width
+  model itself was already correct).
+- **`?` could not be typed at position 0** (`cli/src/tui.ts`): the help
+  keybind swallowed the `?` byte; closing the dialog left the composer empty
+  and pressing `?` re-opened help forever. `openHelpFromKey` now replays the
+  byte into the composer when the dialog closes (`/help` and the palette do
+  not replay). Also un-leaked a smoke mock of `process.stdin.on` that broke
+  later stdin-driven tests.
+
 ## [0.8.12] - 2026-09-17
 
 ### Fixed

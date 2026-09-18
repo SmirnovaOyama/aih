@@ -268,7 +268,20 @@ export function useAltScrollFor(platform: string): boolean {
 // code point -> actual cell count for the user's terminal (GNOME/Konsole,
 // zh_CN CJK font). Verified against the user's table: ⚠ (U+26A0) is 1 cell.
 const WIDTH_OVERRIDES: Record<number, number> = {
+  // All of these are EAW=Ambiguous glyphs rendered as ONE cell by the user's
+  // zh_CN CJK mono font (GNOME/Konsole) even though standard string-width
+  // counts them as 2 (emoji-width). Same font family, same rendering rule:
+  // geometric/misc symbols drawn with halfwidth cells. Verified precedent:
+  // ⚠ (first report), ▶ (second report — the "panel padding walks" bug).
+  // ↩ (U+21A9): used by ↩ recall hint rows.
+  // ⚙ (U+2699): tool-row / group icons.
+  // NOT 0x2753 ❓: that one is Emoji_Presentation (a real emoji) — terminals
+  // render it 2 cells everywhere, so the standard width is correct. Overriding
+  // it to 1 misaligned every question-tool row (user report, third round).
   0x26a0: 1, // ⚠ warning sign
+  0x25b6: 1, // ▶ right-pointing triangle (in_progress todo + running tool icon)
+  0x21a9: 1, // ↩ leftwards arrow with hook (recall hint)
+  0x2699: 1, // ⚙ gear (tool icons)
 };
 const segmenter = new Intl.Segmenter();
 
@@ -881,10 +894,34 @@ constructor(opts: TuiOptions) {
     });
     process.stdout.on("resize", () => {
       this.#clearNext = true;
-      // Legacy conhost (Win10/11 without Windows Terminal) crashes on
-      // synchronized-output + clear-screen during buffer reallocation.
-      // Delay the paint so conhost finishes resizing before we write.
-      const delay = this.#legacyWin ? 250 : 16;
+      // Refresh the viewport dims FIRST: #paint re-reads them, but #follow()
+      // below must compute maxTop against the NEW viewHeight — #rows/#cols are
+      // otherwise only refreshed inside #paint and a follow here would reuse
+      // the stale height and be a no-op (the exact "maximize doesn't stick to
+      // the last message" bug).
+      this.#rows = process.stdout.rows || this.#rows;
+      if (typeof this.#opts.width !== "number" || this.#opts.width <= 0) {
+        this.#cols = process.stdout.columns || this.#cols;
+      }
+      // Resize changes the viewport height, which changes maxTop:
+      // GROWING the window (rows ↑) must re-follow the bottom when the user
+      // was pinned there — the old scrollTop now sits ABOVE the last message
+      // (view shows disjoint rows) and nothing else re-pins it (the paint-time
+      // clamp only pulls DOWN an out-of-range scrollTop, it never pulls UP a
+      // now-too-high view). Without this, maximize left history not stuck to
+      // the last message (user report). Shrink re-follows implicitly because
+      // maxTop grows and the clamp keeps scrollTop at the bottom.
+      if (this.#pinned) this.#follow();
+      // Minimize/maximize animations fire resize events in a burst (one per
+      // intermediate window size, 20-50ms apart); each one invalidates every
+      // item-cache entry (width changed) and forces a full re-render of the
+      // whole transcript — measured ~150ms at 10k items. A 16ms debounce does
+      // NOT merge the burst (events arrive slower than 16ms apart), so every
+      // intermediate size paid a full cold render and the frame felt frozen
+      // for the whole animation. Debounce to the animation-scale 160ms so the
+      // burst collapses into ONE final paint. Legacy conhost additionally
+      // needs even more time to finish its buffer reallocation.
+      const delay = this.#legacyWin ? 400 : 160;
       if (this.#paintTimer) clearTimeout(this.#paintTimer);
       this.#paintScheduled = true;
       this.#paintTimer = setTimeout(() => {
@@ -1441,6 +1478,15 @@ constructor(opts: TuiOptions) {
     this.#held = "";
     this.#escAt = 0;
     this.#lastBareEscAt = 0;
+    // Help-key replay: the `?` that OPENED this dialog was also ordinary text
+    // the user typed. If the composer is still empty (it was empty when help
+    // opened, and the dialog doesn't edit it), refill the byte so the
+    // keystroke is not lost — "?" can finally be typed at position 0.
+    if (ov.help && this.#helpReplay !== null) {
+      const replay = this.#helpReplay;
+      this.#helpReplay = null;
+      if (this.#edit === "") this.#setEdit(replay);
+    }
     ov.resolve(outcome);
     this.requestPaint();
   }
@@ -1612,6 +1658,26 @@ constructor(opts: TuiOptions) {
     });
     this.requestPaint();
   }
+
+  /**
+   * Open help from the HELP KEYBIND (`?` on an empty composer). Same dialog as
+   * openHelp(), but the typed `?` byte is parked in #helpReplay and replayed
+   * into the composer when the dialog closes — the key is BOTH a help
+   * affordance AND ordinary text the user typed. Without the replay, closing
+   * the dialog left the composer empty and pressing `?` again re-opened help
+   * forever: "?" could never be typed at position 0 (reported bug). Direct
+   * `/help` / palette invocations go through openHelp() and do NOT replay.
+   */
+  openHelpFromKey(ch: string): void {
+    this.#helpReplay = ch;
+    this.openHelp();
+    // openHelp() bails on an existing overlay — don't leave a stale replay
+    // parked in that case (the dialog that IS open is not ours to refill).
+    if (!this.#ov()) this.#helpReplay = null;
+  }
+
+  /** Pending help-key replay (see openHelpFromKey): refilled into the composer on close. */
+  #helpReplay: string | null = null;
 
   #overlayMove(delta: number): void {
     const ov = this.#ov()!;
@@ -1798,7 +1864,7 @@ constructor(opts: TuiOptions) {
       if (action === "help") {
         // Help only on an empty, idle composer; otherwise it's a plain '?'.
         if (ch === "?" && this.#edit === "") {
-          this.openHelp();
+          this.openHelpFromKey(ch);
           return;
         }
       }
@@ -2919,7 +2985,10 @@ constructor(opts: TuiOptions) {
     const m = this.#bodyColsMemo;
     if (m && m.key === key) return m.value;
     const pw = this.#panelWidth();
-    const value = pw ? Math.max(20, this.#cols - pw - Tui.PANEL_GAP) : this.#cols;
+    // DECAWM last-column guard (see #paint panelCol): one parked clear column
+    // at the right edge — even without the sidebar the rows must not ride the
+    // final cell (pending-wrap quirk, same user report).
+    const value = pw ? Math.max(20, this.#cols - pw - Tui.PANEL_GAP) : Math.max(20, this.#cols - 1);
     this.#bodyColsMemo = { key, value };
     return value;
   }
@@ -3047,19 +3116,26 @@ constructor(opts: TuiOptions) {
       // clips the WHOLE line (icon + space + text) to pw−4, so every icon
       // line lost columns at the right edge (observed with CJK todo text:
       // a 33-col line against a 30-col budget).
-      const cw = Math.max(2, pw - 7);
+      const cw = Math.max(2, pw - 6);
       for (const t of todos) {
-        const icon =
+        const iconRaw =
           t.status === "in_progress" ? warn(bold("▶"))
           : t.status === "completed" ? success("✓")
           : t.status === "cancelled" ? muted("✕")
           : muted("○");
+        // Every icon+space prefix is exactly 2 display columns: ▶ is 2 cols
+        // (emoji-width), ✓/✕/○ are 1 — the space after a 1-col icon keeps the
+        // first line aligned with the 2-space continuation indent below.
+        // (Before: ▶ 2+1=3 vs ✓ 1+1=2 vs continuation 2 → misaligned padding
+        // after wrap/repaint — the reported "panel text walks" bug.)
+        const iconCols = cols(iconRaw);
+        const prefix = `${iconRaw}${iconCols >= 2 ? "" : " "}`;
         const styled =
           t.status === "in_progress" ? bold(t.content)
           : t.status === "completed" || t.status === "cancelled" ? muted(t.content)
           : t.content;
         const wrapped = wrapStyled(styled, cw);
-        lines.push(`${icon} ${wrapped[0] ?? ""}`);
+        lines.push(`${prefix}${wrapped[0] ?? ""}`);
         for (let i = 1; i < wrapped.length; i += 1) {
           lines.push(`${" ".repeat(2)}${wrapped[i]}`);
         }
@@ -3857,7 +3933,9 @@ constructor(opts: TuiOptions) {
     // the END of #panelLines and got clipped whenever the body was shorter than
     // the panel (the common case on a fresh session).
     const footer = pw ? this.#panelFooter(pw) : null;
-    const leftW = panel ? Math.max(20, width - pw - Tui.PANEL_GAP) : width;
+    // DECAWM guard parity with #bodyCols: keep the last column unwritten in the
+    // no-sidebar layout too (pending-wrap quirk; same report).
+    const leftW = panel ? Math.max(20, width - pw - Tui.PANEL_GAP) : Math.max(20, width - 1);
     let rowIdx = 0;
     const row = (content: string): { left: string; right?: string } => {
       const left = this.#clip(content, leftW);
@@ -4009,7 +4087,16 @@ constructor(opts: TuiOptions) {
     const sync = this.#legacyWin ? "" : `${CSI}?2026h`;
     let out = `${sync}${HIDE}${CSI}H`;
     if (this.#clearNext) out += `${CSI}2J`;
-    const panelCol = width - pw + 1;
+    // DECAWM last-column guard: a row written THROUGH the final column leaves
+    // the real terminal's cursor in the pending-wrap state; combined with the
+    // following absolute cursor positioning it produces edge-column drift on
+    // several terminal families (user report: after minimize→maximize the
+    // sidebar background appeared to grow leftward and the 4-col gutter
+    // shrank — left rows are written full leftW and the panel row lands
+    // exactly at width, filling the very last cell). Park one clear column at
+    // the right edge: the WHOLE frame is now width-1 cells wide and the
+    // cursor never rides the last column.
+    const panelCol = width - pw;
     for (let i = 0; i < rows.length; i += 1) {
       if (!this.#clearNext && this.#lastLines[i] === lines[i]) continue;
       // Close ANY SGR state left open by the previously written row before

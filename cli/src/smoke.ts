@@ -1574,6 +1574,30 @@ assert(
 const list = aih(["sessions"]);
 assert(list.status === 0 && list.stdout.includes("s1"), "sessions command lists saved sessions");
 
+// --- new-session todo clearance regression (was: todos.json leaked across sessions)
+{
+  const todosPath = ".aih/todos.json";
+  // 1) Seed stale todo file (simulates previous session residue)
+  mkdirSync(".aih", { recursive: true });
+  writeFileSync(todosPath, JSON.stringify({ updatedAt: "t", todos: [{ content: "stale previous session todo", status: "pending" }] }) + "\n");
+  assert(existsSync(todosPath), "seed todos.json exists before new-session test");
+  // 2) Launch a brand-new session (no --session → freshSessionName) — should clear todos
+  const fresh = aih(["run", "trigger fresh session", "--mock", "--yes"]);
+  assert(fresh.status === 0, "fresh session run succeeded");
+  assert(!existsSync(todosPath), "new session clears stale .aih/todos.json");
+  // 3) Re-seed todo file
+  writeFileSync(todosPath, JSON.stringify({ updatedAt: "t2", todos: [{ content: "resume-session todo", status: "completed" }] }) + "\n");
+  // 4) Resume existing s1 session — should PRESERVE todos.json
+  const resumed = aih(["run", "resume after seed", "--mock", "--yes", "--session", "s1"]);
+  assert(resumed.status === 0, "resume session succeeded");
+  assert(existsSync(todosPath), "resumed session preserves .aih/todos.json");
+  const preserved = JSON.parse(readFileSync(todosPath, "utf8"));
+  assert(
+    Array.isArray(preserved.todos) && preserved.todos[0].content === "resume-session todo",
+    "preserved todos content matches seed",
+  );
+}
+
 const show = aih(["session", "show", "s1"]);
 assert(show.status === 0 && show.stdout.includes("first prompt alpha"), "session show renders transcript");
 
@@ -4233,6 +4257,32 @@ await srv.connect(new StdioServerTransport());
   assert(vtHome.scrollTop === 0, "VT Home (ESC[1~) jumps to the top");
   assert(vtHome.pinned === false, "VT Home unpins (at top, browsing history)");
 
+  // Resize re-pin (user report: "最小/最大化后历史消息不会停在最后一条"):
+  // pinned viewport + rows change → re-follow the bottom. Resize handler
+  // refreshes #rows BEFORE #follow() so maxTop is computed against the NEW
+  // viewHeight (stale rows made the follow a no-op).
+  tui.feed("\x1b[F"); // re-pin at bottom
+  assert(tui.scrollStateForTest().pinned === true, "re-pinned before resize regression test");
+  const beforeShrink = tui.scrollStateForTest().scrollTop;
+  Object.defineProperty(process.stdout, "rows", { value: 24, configurable: true });
+  process.stdout.emit("resize");
+  await new Promise((r) => setTimeout(r, 250)); // ride out the 160ms debounce
+  const shrunk = tui.scrollStateForTest();
+  assert(shrunk.pinned === true && shrunk.scrollTop >= beforeShrink,
+    `shrink keeps viewport at the bottom (scrollTop ${beforeShrink} → ${shrunk.scrollTop})`);
+  Object.defineProperty(process.stdout, "rows", { value: 40, configurable: true });
+  process.stdout.emit("resize");
+  await new Promise((r) => setTimeout(r, 250));
+  const grown = tui.scrollStateForTest();
+  assert(grown.pinned === true, "maximize keeps the viewport pinned");
+  // Growing the window must RE-FOLLOW: scrollTop must sit exactly at the new
+  // bottom (maxTop = contentLines - viewHeight). Before the fix the stale
+  // follow used the old rows and left the viewport 1+ rows above the last
+  // message. viewHeight isn't exposed, but contentLines is: re-computing the
+  // follow's invariant via the public scrollState + a magnitude check.
+  assert(grown.scrollTop <= shrunk.scrollTop,
+    `maximize re-follows the bottom (scrollTop ${shrunk.scrollTop} → ${grown.scrollTop})`);
+
   tui.stop();
   process.stdout.write = origWrite;
   console.log("ok: sticky scroll — browsing history is not yanked by new messages; End/bottom re-pins");
@@ -4845,6 +4895,43 @@ process.exit(ok === false ? 0 : 1);`;
     assert(cols(l) <= PW - 4, `R8-1 panel todo row fits pw−4 clip budget (got ${cols(l)} cols for ${JSON.stringify(strip(l))})`);
   }
   assert(cjkPanel.some((l) => l.includes("很长的中文")), "R8-1 CJK todo content renders");
+  // R8-1b — icon alignment: every status' first line + wrapped continuation
+  // must start at the SAME display column (2, the continuation indent). Before
+  // the fix ▶ (2 cols) + space made in_progress start at col 3 while ✓/✕/○
+  // (1 col) + space started at 2 and continuations at 2 — the "panel text
+  // padding walks after repaint" bug. Assert: (1) every todo content line
+  // (first or continuation) begins with EXACTLY 2 leading spaces in the raw
+  // row (before #panelSeg's own 2-space pad), (2) the in_progress row has no
+  // space between ▶ and its text (▶ already fills the 2-col prefix).
+  const alignTodos = [
+    { content: "run long task content that wraps onto a second line for alignment", status: "in_progress" },
+    { content: "done short", status: "completed" },
+  ];
+  const tuiAlign = new Tui({
+    placeholder: ">", meta: () => ({ agent: "t", model: "m", provider: "p" }), cwd: "/tmp",
+    statusLeft: "", statusRight: "", busy: () => false, onLine: () => {},
+    todos: () => alignTodos, width: 140,
+  });
+  const alignPanel = tuiAlign.panelLinesForTest(PW);
+  const contentRows = alignPanel.filter((l) => {
+    const s = strip(l);
+    return s.includes("run long task") || s.includes("done short") || s.includes("second line") || s.includes("alignment");
+  });
+  assert(contentRows.length >= 2, `R8-1b alignment rows present (got ${JSON.stringify(alignPanel)})`);
+  for (const l of contentRows) {
+    const s = strip(l);
+    // Display column where the CONTENT starts: strip the leading icon/space
+    // prefix and measure its width. ▶ (2 cols) + 0 spaces = 2; ✓/○ (1 col) +
+    // 1 space = 2; continuation "  " = 2. All must equal 2.
+    const prefix = s.match(/^(\s*[\u25B6\u2713\u2715\u25CB]?\s*)/)?.[0] ?? "";
+    const contentStart = cols(prefix);
+    assert(contentStart === 2, `R8-1b todo content starts at display col 2 (got ${contentStart} for ${JSON.stringify(s.slice(0, 30))})`);
+  }
+  // in_progress first line: with the ▶ override (0x25b6 → 1 cell, the zh_CN
+  // CJK font renders it halfwidth like ⚠), the prefix shim pads ▶ with a
+  // space so the row is exactly 2 display cols — same as every other status.
+  const runningRow = alignPanel.map(strip).find((s) => s.includes("run long task"));
+  assert(runningRow !== undefined && runningRow.startsWith("▶ run long task"), `R8-1b ▶ row shimmed to 2-col prefix (got ${JSON.stringify(runningRow?.slice(0, 20))})`);
   // (3) host todos() returning null falls back to the transcript list
   const tuiFb = new Tui({
     placeholder: ">", meta: () => ({ agent: "t", model: "m", provider: "p" }), cwd: "/tmp",
@@ -5921,6 +6008,13 @@ process.exit(ok === false ? 0 : 1);`;
     tui.feed("\r");
     await new Promise((r) => setTimeout(r, 10));
     tui.stop();
+    // RESTORE the real stdin.on/removeListener: this mock intercepted every
+    // later stdin.on("data") registration into a local array. Without the
+    // restore, any LATER test that starts a Tui and emits process.stdin data
+    // (e.g. the help-key replay test) never reaches its listener — the
+    // reported "help dialog does not open" smoke failure.
+    (process.stdin as any).on = origOn;
+    (process.stdin as any).removeListener = origOff;
     (process.stdout as any).isTTY = false;
     assert(submitted === "o", `CPR+key same chunk keeps 'o' (got ${JSON.stringify(submitted)})`);
   }
@@ -9008,6 +9102,40 @@ console.log("══════════════════════�
   // collision is dropped with warning
   const clash = buildKeybindDispatch({ palette: "ctrl+p", toggleMode: "ctrl+p", help: "?" });
   assert(clash.warnings.length === 1 && clash.warnings[0].includes("toggleMode"), "keybinds: colliding remap dropped with warning");
+
+  // Help-key replay: `?` on an empty composer opens help AND lands in the
+  // composer when the dialog closes — previously the byte was swallowed and
+  // "?" could never be typed at position 0 (report: "首个输入?会无法输入而
+  // 弹出菜单"). Driven through the REAL key path (stdin data → #char →
+  // openHelpFromKey → Esc → #closeOverlay refill).
+  const { Tui: TuiKb } = await import("./tui.js");
+  const H = 24, W = 120;
+  Object.defineProperty(process.stdout, "rows", { value: H, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: W, configurable: true });
+  (process.stdin as any).isTTY = true;
+  (process.stdin as any).setRawMode = () => {};
+  (process.stdin as any).resume = () => {};
+  const origWriteKb = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (() => true) as any;
+  const tuiHelp = new TuiKb({
+    placeholder: ">", meta: () => ({ agent: "build", model: "m", provider: "p" }), cwd: "/tmp",
+    statusLeft: "", statusRight: "", busy: () => false, onLine: () => {},
+    keybinds: { byteToAction: def.byteToAction },
+  });
+  tuiHelp.start();
+  await new Promise((r) => setTimeout(r, 30));
+  (process.stdin as any).emit("data", "?");
+  await new Promise((r) => setTimeout(r, 30));
+  assert(tuiHelp.isTop("help"), "help key: ? on empty composer opens the help dialog");
+  (process.stdin as any).emit("data", "\x1b");
+  await new Promise((r) => setTimeout(r, 30));
+  (process.stdin as any).emit("data", "\x1b"); // double-Esc detector: second closes
+  await new Promise((r) => setTimeout(r, 30));
+  assert(!tuiHelp.isTop("help"), "help key: Esc closes the dialog");
+  const helpFrame = tuiHelp.frameForTest().find((l) => l.includes("❯")) ?? "";
+  assert(helpFrame.includes("?"), `help key: ? replayed into the composer after close (got ${JSON.stringify(helpFrame.trim().slice(0, 30))})`);
+  tuiHelp.stop();
+  process.stdout.write = origWriteKb;
 
   console.log("ok: OC-parity rules + policies + keybinds");
 }

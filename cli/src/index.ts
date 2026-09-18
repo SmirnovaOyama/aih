@@ -242,7 +242,7 @@ import {
   type Trace,
 } from "./measure.js";
 
-export const VERSION = "0.8.12";
+export const VERSION = "0.8.13";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );
@@ -1394,6 +1394,23 @@ function freshSessionName(): string {
   return name;
 }
 
+/**
+ * Todo 状态是 session 级状态，但 `.aih/todos.json` 是项目级共享文件（TUI
+ * 右面板把它当首选数据源，见 makeTuiTodos / #panelTodos）。全新会话启动时
+ * 它残留上个会话的 todo —— 修复：session 文件不存在（= 全新会话）则清空
+ * todos.json；恢复会话（文件存在，--session/-c）保留，让 todo 随时间线恢复。
+ * P#37② /restore（同会话内回滚）不受影响。
+ */
+function resetTodoStateForFreshSession(sessionPath: string | undefined): void {
+  if (sessionPath && existsSync(sessionPath)) return; // 恢复会话 — 保留
+  const p = join(process.cwd(), ".aih", "todos.json");
+  try {
+    if (existsSync(p)) rmSync(p, { force: true });
+  } catch {
+    /* best-effort：清不掉也不阻断启动 */
+  }
+}
+
 function resolveSessionPath(flags: Record<string, string | boolean>): string | undefined {
   let name = str(flags, "session");
   const cont = flags["continue"] ?? flags["c"];
@@ -1559,6 +1576,7 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
   const sessionPath = bool(flags, "ephemeral")
     ? undefined
     : (resolveSessionPath(flags) ?? join(SESSIONS_DIR, `${freshSessionName()}.jsonl`));
+  resetTodoStateForFreshSession(sessionPath);
   try {
     const gate = makeSessionGate(flags);
     const registry = new ToolRegistry(gate);
@@ -1927,6 +1945,7 @@ async function cmdWorkflow(
     const sessionPath = bool(flags, "ephemeral")
       ? undefined
       : (resolveSessionPath(flags) ?? join(SESSIONS_DIR, `${freshSessionName()}.jsonl`));
+    resetTodoStateForFreshSession(sessionPath);
     try {
       const gate = makeSessionGate(flags);
       const registry = new ToolRegistry(gate);
@@ -2084,6 +2103,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   const sessionPath = bool(flags, "ephemeral")
     ? undefined
     : (resolveSessionPath(flags) ?? join(SESSIONS_DIR, `${freshSessionName()}.jsonl`));
+  resetTodoStateForFreshSession(sessionPath);
   const gate = makeSessionGate(flags);
   const backendDefs = await backend.listTools();
   let agentMode: "build" | "plan" = "build";

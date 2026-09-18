@@ -22,7 +22,7 @@
  */
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { createInterface } from "node:readline";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { AgentLoop, SessionLog, SessionStore, ToolRegistry } from "@aih/core";
 import type { SessionEvent } from "@aih/core";
@@ -88,6 +88,16 @@ export async function startServe(
   const sessionsDir = join(cwd, ".aih", "sessions");
   mkdirSync(sessionsDir, { recursive: true });
   const sessionPath = join(sessionsDir, `${sessionName}.jsonl`);
+  // Todo 状态是 session 级状态：全新 serve 会话（--session 未指定或文件不存在）
+  // 清空项目级 .aih/todos.json，避免右面板显示上个会话的残留；恢复会话保留。
+  if (!existsSync(sessionPath)) {
+    try {
+      const todosPath = join(cwd, ".aih", "todos.json");
+      if (existsSync(todosPath)) rmSync(todosPath, { force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
   const log = new SessionStore(sessionPath).load() ?? new SessionLog();
   const gate = makeSessionGate(flags);
   const registry = new ToolRegistry(gate);
