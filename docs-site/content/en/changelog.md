@@ -19,6 +19,10 @@ The full itemized record lives in the repo [`CHANGELOG.md`](https://github.com/s
 - **Clean-slate offline packaging** — the packaged default config now ships **no providers, no models and no proxy**, a clean slate so each user configures their own endpoint after install (`aih connect` / `aih config` / `aih.json`). The build machine's local `aih.json` (providers, models, proxy, local endpoints) is stripped, not merged, so nothing machine-local leaks into the installer.
 - **Fresh-install startup guidance** — with nothing configured, `aih run` / `aih chat` no longer fail with a cryptic "no API key" / "no model id" error; the user is pointed at `aih connect` (catalog) or adding a provider to `aih.json`. Self-hosted / keyless endpoints need no key; `--mock` runs an offline demo.
 
+**Fixed**
+
+- **node tarball silently dropped new runtime deps** — the runtime dep list was hardcoded, so a new runtime dep added to a workspace (e.g. `undici` for the SOCKS5 proxy) was missing from the tarball and the staged-tree sanity check failed. The dep set is now derived dynamically from each workspace's `package.json` (matching `scripts/offline-package`), so adding a dep to a workspace ships it automatically.
+
 **Docs**
 
 - **0.8.13 release page width** — the content column was capped at 840px and left-aligned inside a ~1200px content area, leaving a large empty band on the right. The reading column is now wider and centered so the page uses its width properly on desktop while staying responsive on mobile.

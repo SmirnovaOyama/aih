@@ -19,6 +19,10 @@ description: AIH 版本更新日志 —— 0.8.x / 0.7.x / 0.6.x / 0.5.x 的主�
 - **离线包默认配置改为"净版"** — 打包默认配置不再携带任何 provider / 模型 / 代理，安装后由用户自行配置端点（`aih connect` / `aih config` / `aih.json`）；构建机本地的 `aih.json`（provider、模型、代理、内网端点）被剥离而非合并，杜绝机器本地信息泄漏进安装包。
 - **全新安装启动引导** — 未配置任何 provider 时，`aih run` / `aih chat` 不再报晦涩的"no API key"/"no model id"，而是引导用户 `aih connect`（浏览目录）或在 `aih.json` 加 provider；自托管 / 免 key 端点无需密钥，`--mock` 可离线演示。
 
+**修复**
+
+- **node tarball 静默丢失新增运行时依赖** — 运行时依赖列表此前硬编码，workspace 新增的运行时依赖（如 SOCKS5 用的 `undici`）会缺失于 tarball 并导致暂存树自检失败；现从各 workspace 的 `package.json` 动态推导（与 `scripts/offline-package` 一致），新增依赖自动随包发布。
+
 **文档**
 
 - **0.8.13 发布页宽度修复** — 内容列此前被限宽 840px 且左对齐，在约 1200px 的内容区里右侧留一大片空白；现加宽阅读列并居中，桌面端正常利用宽度，移动端仍响应式。

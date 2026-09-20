@@ -20,6 +20,10 @@
   or add a provider to `aih.json`. Self-hosted / keyless endpoints need no key; `--mock` runs an offline demo.
 - **TUI multi-select + compaction hints** (`cli/src/tui.ts`): the multi-select column window widens monotonically (drag right-then-down keeps the swept width), and the status area surfaces an "▲ compact soon (auto ≥ 80%)" warning.
 
+### Fixed
+
+- **node tarball silently dropped new runtime deps** (`scripts/package`): the runtime dep list was hardcoded (`@modelcontextprotocol/sdk` / `string-width` / `zod`), so a new runtime dep added to a workspace (e.g. `undici` for the SOCKS5 proxy) was missing from the tarball and the staged-tree sanity check failed. The dep set is now derived dynamically from each workspace's `package.json` (matching `scripts/offline-package`), so adding a dep to a workspace ships it automatically.
+
 ### Docs
 
 - **0.8.13 release page width** (`docs-site/style.css`): the content column was capped at 840px and left-aligned inside a ~1200px content area, leaving a large empty band on the right. The reading column is now wider and centered, so the page uses its width properly on desktop while staying responsive on mobile.
