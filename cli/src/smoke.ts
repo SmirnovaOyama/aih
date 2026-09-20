@@ -2027,6 +2027,9 @@ assert(
   assert(BUILTIN_SLASH_HEADS.has("connect"), "/connect is a known builtin slash head");
   assert(isKnownSlashCommand("/connect"), "isKnownSlashCommand('/connect') → true");
   assert(isKnownSlashCommand("/connect deepseek"), "/connect <id> is still the known head (falls into the /connect handler)");
+  assert(BUILTIN_SLASH_HEADS.has("socks"), "/socks is a known builtin slash head");
+  assert(isKnownSlashCommand("/socks"), "isKnownSlashCommand('/socks') → true");
+  assert(isKnownSlashCommand("/socks off"), "/socks off is still the known head (falls into the /socks handler)");
 
   const cat = connectCatalog();
   assert(cat.length >= 20, `catalog has a curated set (got ${cat.length})`);

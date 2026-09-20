@@ -2487,7 +2487,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       { name: "mode plan", hint: "read-only planning (tab)", run: () => setMode("plan") },
       {
         name: "socks toggle",
-        hint: "/socks [on|off] — route LLM requests through the SOCKS5 tunnel or direct",
+        hint: "/socks — toggle SOCKS5 tunnel (on ⇄ off) for LLM requests",
         run: () => handleLine("/socks"),
       },
       { name: "compact context", hint: "/compact — summarize earlier history", run: () => handleLine("/compact") },
@@ -4252,18 +4252,21 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       return;
     }
     // /socks — toggle the SOCKS5 proxy for LLM requests at runtime (no config
-    // edit needed). `socksEnabled` gates buildRealLlm's fetchImpl injection:
-    // off → LLM calls go direct even when aih.json has proxy.socks5; on →
-    // restored to configured. The status line shows the current state
+    // edit needed). Bare `/socks` toggles (on→off, off→on); `/socks on|off`
+    // sets an explicit state. `socksEnabled` gates buildRealLlm's fetchImpl
+    // injection: off → LLM calls go direct even when aih.json has proxy.socks5;
+    // on → restored to configured. The status line shows the current state
     // ("SOCKS on"/"SOCKS off" in the meta area).
     if (input === "/socks" || input.startsWith("/socks ")) {
       const arg = input === "/socks" ? "" : input.slice("/socks ".length).trim();
-      if (arg === "on" || arg === "") {
+      if (arg === "" || arg === "toggle") {
+        socksEnabled = !socksEnabled;
+      } else if (arg === "on") {
         socksEnabled = true;
       } else if (arg === "off") {
         socksEnabled = false;
       } else {
-        tui.pushSystem("usage: /socks [on|off] — toggle the SOCKS5 proxy for LLM requests");
+        tui.pushSystem("usage: /socks — toggle (or /socks on|off to set explicitly)");
         return;
       }
       // Persist the override so buildRealLlm (module scope) picks it up on the
