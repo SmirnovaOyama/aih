@@ -4957,6 +4957,31 @@ process.exit(ok === false ? 0 : 1);`;
 }
 
 {
+  // /socks indicator — the status line must show whether LLM traffic routes
+  // through the SOCKS tunnel ("SOCKS on") or direct ("SOCKS off"), and hide
+  // the segment when the TUI doesn't report a socks state (other embeddings).
+  const { Tui } = await import("./tui.js");
+  const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const mk = (socks?: "on" | "off") =>
+    new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "build", model: "m", provider: "p", ...(socks ? { socks } : {}) }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "",
+      busy: () => false,
+      onLine: () => {},
+      width: 100,
+    });
+  const rowOn = mk("on").statusRowForTest(100);
+  const rowOff = mk("off").statusRowForTest(100);
+  const rowNone = mk().statusRowForTest(100);
+  assert(strip(rowOn).includes("SOCKS on"), `/socks: status line shows "SOCKS on" (got ${strip(rowOn)})`);
+  assert(strip(rowOff).includes("SOCKS off"), `/socks: status line shows "SOCKS off" (got ${strip(rowOff)})`);
+  assert(!strip(rowNone).includes("SOCKS"), `/socks: segment hidden when TUI reports no socks state (got ${strip(rowNone)})`);
+}
+
+{
   // Panel todos (2026-09-10 user report: "压缩之后面板的 todo 没了"):
   //  (1) the panel must show the list even when ALL items are completed —
   //      before the fix `todos.some(status !== "completed")` hid it entirely;

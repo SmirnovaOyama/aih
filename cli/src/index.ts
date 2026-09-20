@@ -666,6 +666,11 @@ export function isOpencodeEndpoint(baseUrl: string): boolean {
   return /(^|\.)opencode\.ai(:|\/|$)/.test(host);
 }
 
+// Runtime SOCKS toggle read by buildRealLlm (all call sites pick it up). The
+// TUI session sets this via /socks; when false, LLM requests go direct even
+// if aih.json has proxy.socks5. undefined = no override (follow config).
+let socksOverride: boolean | undefined;
+
 function buildRealLlm(flags: Record<string, string | boolean>, sessionId?: string) {
   const resolved = resolveLlm({
     flagModel: str(flags, "model"),
@@ -755,7 +760,11 @@ function buildRealLlm(flags: Record<string, string | boolean>, sessionId?: strin
   // general capability: any provider's LLM call can go through a SOCKS
   // endpoint (self-hosted networks, corporate egress, supported-region exits).
   // No core changes — OpenAICompatibleLLM accepts a caller-supplied fetchImpl.
-  const socks = resolveSocksProxy(loadProxy());
+  // A /socks off override (socksOverride === false) forces direct even when
+  // config has a proxy; undefined (no override) follows config.
+  const configHasSocks = resolveSocksProxy(loadProxy()) !== undefined;
+  const socksActive = socksOverride === undefined ? configHasSocks : socksOverride;
+  const socks = socksActive ? resolveSocksProxy(loadProxy()) : undefined;
   const fetchImpl = socks
     ? async (input: string | URL | Request, init?: RequestInit) =>
         (await socksFetch(input.toString(), init as Record<string, unknown>, socks)) as Response
@@ -2141,6 +2150,14 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   const gate = makeSessionGate(flags);
   const backendDefs = await backend.listTools();
   let agentMode: "build" | "plan" = "build";
+  // SOCKS5 proxy toggle for LLM requests. Default = whatever the config says
+  // (loaded at startup); `/socks on|off` flips it at runtime without touching
+  // aih.json. When OFF, buildRealLlm skips the fetchImpl injection so LLM
+  // calls go direct.
+  let socksEnabled = resolveSocksProxy(loadProxy()) !== undefined;
+  // Initial sync: module-level override follows this session's startup state
+  // (undefined → follow config in non-TUI runs, e.g. `aih run`).
+  if (socksOverride === undefined) socksOverride = socksEnabled;
   let registry = new ToolRegistry(gate);
   let skills: Skill[] = [];
   // CC#52 — session-lived load-skill dedup tracker; survives registry rebuilds,
@@ -2468,6 +2485,11 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       { name: "connect provider", hint: "/connect — add/connect an API provider", run: () => openConnectPicker() },
       { name: "mode build", hint: "full toolset (tab)", run: () => setMode("build") },
       { name: "mode plan", hint: "read-only planning (tab)", run: () => setMode("plan") },
+      {
+        name: "socks toggle",
+        hint: "/socks [on|off] — route LLM requests through the SOCKS5 tunnel or direct",
+        run: () => handleLine("/socks"),
+      },
       { name: "compact context", hint: "/compact — summarize earlier history", run: () => handleLine("/compact") },
       { name: "usage", hint: "/usage — token usage this session", run: () => handleLine("/usage") },
       { name: "fork session", hint: "/fork <target> [--from seq] — branch a session", run: () => handleLine("/fork") },
@@ -2730,7 +2752,12 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     placeholder: 'Ask anything... "add a todo"',
     keybinds: { byteToAction },
     keybindWarnings: kbWarnings,
-    meta: () => ({ agent: agentMode, model: modelLabel, provider: providerLabel }),
+    meta: () => ({
+      agent: agentMode,
+      model: modelLabel,
+      provider: providerLabel,
+      socks: socksEnabled ? "on" : "off",
+    }),
     cwd: process.cwd(),
     // opencode-parity footer: version lives on the second (hints) row's
     // left side; keep statusLeft as the bare app name so it is not duplicated.
@@ -2800,6 +2827,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/memory",
       "/model",
       "/models",
+      "/socks",
       "/usage",
       "/compact",
       "/update",
@@ -4223,6 +4251,27 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       else tui.pushSystem("usage: /mode <build|plan>");
       return;
     }
+    // /socks — toggle the SOCKS5 proxy for LLM requests at runtime (no config
+    // edit needed). `socksEnabled` gates buildRealLlm's fetchImpl injection:
+    // off → LLM calls go direct even when aih.json has proxy.socks5; on →
+    // restored to configured. The status line shows the current state
+    // ("SOCKS on"/"SOCKS off" in the meta area).
+    if (input === "/socks" || input.startsWith("/socks ")) {
+      const arg = input === "/socks" ? "" : input.slice("/socks ".length).trim();
+      if (arg === "on" || arg === "") {
+        socksEnabled = true;
+      } else if (arg === "off") {
+        socksEnabled = false;
+      } else {
+        tui.pushSystem("usage: /socks [on|off] — toggle the SOCKS5 proxy for LLM requests");
+        return;
+      }
+      // Persist the override so buildRealLlm (module scope) picks it up on the
+      // next LLM construction.
+      socksOverride = socksEnabled;
+      tui.pushSystem(`SOCKS ${socksEnabled ? "on" : "off"} — LLM requests ${socksEnabled ? "through the tunnel" : "direct"} (next LLM call picks it up)`);
+      return;
+    }
     if (input.startsWith("/inject ")) {
       loop.inject(input.slice("/inject ".length));
       tui.pushSystem("context injected; lands on next turn");
@@ -4317,7 +4366,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         return;
       }
       tui.pushSystem(
-        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /connect /model /models /usage /compact /checkpoint /restore /fork /tree /skills /skill-doctor /inject /events /clear /exit`,
+        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /connect /model /models /socks /usage /compact /checkpoint /restore /fork /tree /skills /skill-doctor /inject /events /clear /exit`,
       );
       return;
     }

@@ -60,7 +60,7 @@ export interface TuiItem {
 
 export interface TuiOptions {
   placeholder: string;
-  meta(): { agent: string; model: string; provider: string };
+  meta(): { agent: string; model: string; provider: string; socks?: "on" | "off" };
   /** opencode-parity footer: aih version shown at the left of the second row. */
   version?: string;
   cwd: string;
@@ -3151,6 +3151,11 @@ constructor(opts: TuiOptions) {
     return this.#panelFooter(pw);
   }
 
+  /** Test hook for #statusRow (the bottom identity/status line). */
+  statusRowForTest(width: number): string {
+    return this.#statusRow(width);
+  }
+
   /** Test hook: the last painted frame, ANSI-stripped (authoritative render). */
   frameForTest(): string[] {
     const strip = (s: string): string => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\x1b[()][0-9A-Z]/g, "");
@@ -3795,7 +3800,11 @@ constructor(opts: TuiOptions) {
     // need to see first.
     const model = accent(bold(m.model));
     const agent = m.agent === "plan" ? warn(bold(m.agent)) : muted(m.agent);
-    return `${model}${muted(" · ")}${muted(m.provider)}${muted(" · ")}${agent}`;
+    // SOCKS indicator: follow the agent/provider tags so the user always sees
+    // whether LLM traffic routes through the tunnel ("SOCKS on") or direct
+    // ("SOCKS off"). Hidden when the TUI doesn't report a socks state.
+    const socks = m.socks ? ` · ${m.socks === "on" ? success("SOCKS on") : muted("SOCKS off")}` : "";
+    return `${model}${muted(" · ")}${muted(m.provider)}${muted(" · ")}${agent}${socks}`;
   }
 
   #hintsRow(width: number): string {
