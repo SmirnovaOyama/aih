@@ -26,6 +26,17 @@ const MAX_STALL_RESUMES = 1;
  * session forever.
  */
 const MAX_QUOTA_WAITS = 2;
+/**
+ * CC#51 — max network park waits per TURN (cumulative across while
+ * iterations). The adapter's own retry budget (×3 for network bursts) plus
+ * these turn-level parks must stay bounded: without a cumulative cap, a
+ * provider that times out on every call (observed: deepseek-v4-flash-free /
+ * nemotron-3.5-lightning-free on opencode zen) makes every user message spin
+ * for minutes and each new message re-burn the whole budget. Symmetric with
+ * MAX_QUOTA_WAITS; exceeding it ends the turn with stopReason
+ * "network_exhausted" instead of hanging.
+ */
+const MAX_NETWORK_PARK_WAITS = 3;
 /** Default wait (s) when the provider gives no Retry-After. */
 const QUOTA_DEFAULT_WAIT_SEC = 60;
 /** Hard cap on a single wait (s) — a "reset in 3 days" is not something to sit through. */
@@ -694,6 +705,10 @@ export class AgentLoop {
     let stallResumes = 0;
     // CC#51 — bounded quota-exhaustion waits for this turn.
     let quotaWaits = 0;
+    // CC#51 — cumulative network park waits for this turn (across while
+    // iterations). NOT reset per iteration — the cap is per TURN, so a
+    // provider that never comes back can't make the loop spin forever.
+    let networkParkWaits = 0;
 
     while (steps < this.#maxSteps && !ac.signal.aborted) {
       steps += 1;
@@ -866,25 +881,35 @@ export class AgentLoop {
           // tens of seconds (Zen/Cloudflare bursts), and killing the turn
           // loses the whole in-flight task ("run_cmd … fetch failed" then the
           // conversation just ends). Park briefly and re-issue the SAME call
-          // — bounded, so a truly dead network still ends the turn honestly.
-          if (!CONTEXT_ERROR.test(message) && networkFailure && !unreachable && !nearWindow) {
+          // — bounded by MAX_NETWORK_PARK_WAITS (TURN-level, cumulative), so a
+          // truly dead network still ends the turn honestly instead of
+          // spinning forever on a provider that never answers (observed:
+          // opencode zen models that time out on every request).
+          if (
+            !CONTEXT_ERROR.test(message) &&
+            networkFailure &&
+            !unreachable &&
+            !nearWindow &&
+            networkParkWaits < MAX_NETWORK_PARK_WAITS
+          ) {
             // Park waits (ms), test-tunable via AIH_NETWORK_PARK_MS="100,200".
             const NET_WAITS_MS = ((): number[] => {
               const raw = (process.env.AIH_NETWORK_PARK_MS ?? "").split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
               return raw.length ? raw.slice(0, 3) : [10_000, 20_000];
             })();
             let recovered = false;
-            for (let netWait = 0; netWait < NET_WAITS_MS.length; netWait += 1) {
+            for (let netWait = 0; netWait < NET_WAITS_MS.length && networkParkWaits < MAX_NETWORK_PARK_WAITS; netWait += 1) {
               const waitMs = NET_WAITS_MS[netWait];
+              networkParkWaits += 1;
               this.#log.append({
                 type: "quota_wait",
                 turnId,
                 retryAfterSec: Math.round(waitMs / 1000),
                 resumeAtMs: Date.now() + waitMs,
-                wait: netWait + 1,
+                wait: networkParkWaits,
                 reason: "network",
               });
-              hooks?.quotaWait?.begin?.({ retryAfterSec: Math.round(waitMs / 1000), resumeAtMs: Date.now() + waitMs, wait: netWait + 1 });
+              hooks?.quotaWait?.begin?.({ retryAfterSec: Math.round(waitMs / 1000), resumeAtMs: Date.now() + waitMs, wait: networkParkWaits });
               await sleepMs(waitMs, ac.signal);
               hooks?.quotaWait?.end?.(ac.signal.aborted ? "aborted" : "done");
               if (ac.signal.aborted) break;
@@ -904,6 +929,16 @@ export class AgentLoop {
             } else if (!ac.signal.aborted && CONTEXT_ERROR.test(message)) {
               // the parked retries surfaced a DIFFERENT (context) failure —
               // fall through to the compact+retry path below
+            } else if (!ac.signal.aborted && networkParkWaits >= MAX_NETWORK_PARK_WAITS) {
+              // CC#51 — the turn-level network park budget is exhausted: the
+              // provider never answered across the adapter's extended retries
+              // AND every park wait (observed: opencode zen models that time
+              // out on every request). Do NOT throw (which would leave the
+              // TUI with an unhandled spinner followed by a red error) — end
+              // the turn honestly with a dedicated stopReason so the UI shows
+              // a clear "network exhausted" signal instead of spinning.
+              stopReason = "network_exhausted";
+              break;
             } else {
               throw err;
             }
@@ -1268,7 +1303,7 @@ export class AgentLoop {
 
     // PE#4 — an "escalated" stop (sensor red after retries / hard budget) is
     // more specific than "cancelled": the loop aborted on purpose, not by user.
-    if (stopReason !== "escalated") {
+    if (stopReason !== "escalated" && stopReason !== "network_exhausted") {
       if (ac.signal.aborted) stopReason = "cancelled";
       else if (steps >= this.#maxSteps) stopReason = "max_steps";
       else if (truncated) stopReason = "max_tokens";
@@ -1615,10 +1650,10 @@ export class AgentLoop {
    */
   async #completeSummary(messages: ChatMessage[]): Promise<{ text: string; usage?: TokenUsage }> {
     let maxTokens = SUMMARY_OUTPUT_TOKENS;
-    // Some gateways 403 a summary request REGARDLESS of identity headers when
-    // the active model is gated. The MAIN turn passes because the user's
+    // Some gateways REJECT a summary request REGARDLESS of identity headers
+    // when the active model is gated. The MAIN turn passes because the user's
     // active model is pool-ok — but compaction shares this.#llm, so when the
-    // ACTIVE model is gated, every compact dies with 403. Fallback: on
+    // ACTIVE model is gated, every compact dies. Fallback: on
     // FreeTierError, retry the summary with a pool-friendly override
     // (per-request `model`, adapter-level; the main loop's model is never
     // touched). AIH_SUMMARY_MODEL env overrides the fallback choice.
@@ -1708,7 +1743,7 @@ export class AgentLoop {
       // bloated session snowballs into minute-long model responses. One
       // stderr line keeps the failure diagnosable without a debug flag.
       // Include trigger + turnId so a long session's "why didn't it compact"
-      // is traceable to the exact turn and the reason (summary LLM 403 /
+      // is traceable to the exact turn and the reason (summary LLM denial /
       // timeout / empty response) without a debug flag.
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(
@@ -1748,7 +1783,7 @@ export class AgentLoop {
     // conversation's prompt-cache lineage).
     // Fresh-session admission gate: the side-channel summary sid gets its OWN
     // first-contact with the gateway; on some networks a fresh ses id admission
-    // is rejected (403) while the main conversation's ALREADY-ESTABLISHED
+    // is rejected while the main conversation's ALREADY-ESTABLISHED
     // session passes. Default keeps P#36⑤ isolation; AIH_SUMMARY_REUSE_SID=1
     // reuses the MAIN session id so compaction rides the established session's
     // admission.

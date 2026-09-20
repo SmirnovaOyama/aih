@@ -7,6 +7,19 @@ description: AIH release notes — key changes in 0.8.x / 0.7.x / 0.6.x / 0.5.x.
 
 The full itemized record lives in the repo [`CHANGELOG.md`](https://github.com/summit4you/aih/blob/main/CHANGELOG.md) (Keep a Changelog format, SemVer). This page is a per-version summary.
 
+## 0.8.15 (2026-09-20)
+
+**Added**
+
+- **SOCKS5 proxy for LLM requests** — LLM API calls can now route through a SOCKS5 tunnel when `proxy.socks5` / `AIH_SOCKS5_PROXY` is set (self-hosted networks, corporate egress, supported-region exits); `buildRealLlm` injects a `socksFetch`-based `fetchImpl` so any provider's requests can go through the tunnel, with no core changes.
+- **`/socks` runtime toggle** — switch the LLM SOCKS5 proxy on/off without restarting: bare `/socks` flips the state (on⇄off), `/socks on|off` sets it explicitly; a `socksOverride` gates the `fetchImpl` injection (off forces direct even when `aih.json` has `proxy.socks5`), and the TUI status line surfaces a `SOCKS on` / `SOCKS off` indicator.
+
+**Fixed**
+
+- **Bounded network recovery in the agent loop** — a provider that accepts the connection but never answers (silent timeouts) could make every user message spin for minutes and re-burn the whole retry budget on the next message; a cumulative, TURN-level park cap now bounds the waits and ends the turn honestly with a dedicated `network_exhausted` stopReason instead of hanging, with a clear "network retries exhausted" hint in the TUI.
+- **Response-header timeout at the adapter** — a provider that accepts the TCP/SOCKS connection but never returns HTTP headers would hang the fetch forever (TUI spins, no `turn/end`); a `RESPONSE_HEADER_TIMEOUT_MS` guard (default 60s, `0` disables) bounds the header wait and folds it into the network-retry budget and the turn-level cap.
+- **Guardian reviewer session parity + event persistence** — the Guardian's auxiliary review LLM now shares the main loop's conversation-stable session identity across all three call sites (`run` / `workflow` / TUI `chat`) so it no longer diverges onto a per-instance random id, and every review result is persisted to the session log as a model-invisible `app/event` (`source: "guardian/review"`), so denial/error outcomes are visible in the JSONL instead of only on the terminal.
+
 ## 0.8.14 (2026-09-20)
 
 **Added**
@@ -15,7 +28,7 @@ The full itemized record lives in the repo [`CHANGELOG.md`](https://github.com/s
 
 **Changed**
 
-- **Auxiliary LLM calls now stream at the adapter level** — side-calls that bypass the main loop's streaming (goal judge, `best_of_n`, MEA guardian/auditor, dream/title/branch distillation, compaction summary) previously emitted `stream:false` and were rejected (403) by gateways that only accept streaming from a keyless client. The adapter now owns the stream decision in one place so every such call is covered; the final text is still fully assembled and callers see no behavior change.
+- **Auxiliary LLM calls now stream at the adapter level** — side-calls that bypass the main loop's streaming (goal judge, `best_of_n`, MEA guardian/auditor, dream/title/branch distillation, compaction summary) previously emitted `stream:false` and were rejected by gateways that only accept streaming from a keyless client. The adapter now owns the stream decision in one place so every such call is covered; the final text is still fully assembled and callers see no behavior change.
 - **Clean-slate offline packaging** — the packaged default config now ships **no providers, no models and no proxy**, a clean slate so each user configures their own endpoint after install (`aih connect` / `aih config` / `aih.json`). The build machine's local `aih.json` (providers, models, proxy, local endpoints) is stripped, not merged, so nothing machine-local leaks into the installer.
 - **Fresh-install startup guidance** — with nothing configured, `aih run` / `aih chat` no longer fail with a cryptic "no API key" / "no model id" error; the user is pointed at `aih connect` (catalog) or adding a provider to `aih.json`. Self-hosted / keyless endpoints need no key; `--mock` runs an offline demo.
 

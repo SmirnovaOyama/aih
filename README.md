@@ -962,7 +962,7 @@ with any MCP app tools; same-name → app tool wins):
 | `remember` | project memory: append/rewrite `.aih/memory.md`, cross-session persistent knowledge | allow |
 | `memory_recall` | retrieve project+user memory: free-text query → token-overlap scoring returns the most relevant entries (zero deps; fallback recall when the injected block is budget-truncated) | allow |
 | `question` | the model asks the user a question and waits (TUI inline Q&A line) | allow |
-| `webfetch` | fetch URL → plain text (HTML→text, 64KB cap). Browser-grade UA + Accept headers, one bounded network retry, Cloudflare 403 challenge auto-retries with an honest UA, `timeout` param (seconds, default 30, cap 120), content-length precheck before download, actionable failure messages (suggests alternate endpoint/websearch). Optional SOCKS5 proxy (config `proxy.socks5` / `AIH_SOCKS5_PROXY`) — routes HTTP **and** HTTPS through the tunnel | allow |
+| `webfetch` | fetch URL → plain text (HTML→text, 64KB cap). Browser-grade UA + Accept headers, one bounded network retry, Cloudflare bot-challenge auto-retry with an honest UA, `timeout` param (seconds, default 30, cap 120), content-length precheck before download, actionable failure messages (suggests alternate endpoint/websearch). Optional SOCKS5 proxy (config `proxy.socks5` / `AIH_SOCKS5_PROXY`) — routes HTTP **and** HTTPS through the tunnel | allow |
 | `websearch` | DuckDuckGo search (titles/URLs/snippets, key-free) | allow |
 | `task` | dispatch subagent (independent context, ≤8 steps, no further nesting) | allow* |
 | `apply_patch` | multi-file patch (Add/Update/Delete/Move, opencode format) | ask |
@@ -1138,7 +1138,7 @@ When one credential fails, **only its owner degrades** — never silently fall b
 to another credential. An AIH owner is a configured LLM provider (`empero` /
 `llamacpp` / `zhipu` / `opencode` …). Semantics:
 
-- **Isolated degradation** — on credential-class failure (401/403 auth, or quota
+- **Isolated degradation** — on credential-class failure (auth rejection, or quota
   exhaustion), that owner is marked unavailable, with a **redacted** reason recorded
   in the user-level `owner.json`; the original error still propagates (no automatic
   switch to another credential). The next **successful call clears** the degradation.

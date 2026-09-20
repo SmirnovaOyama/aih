@@ -10,7 +10,7 @@
  *
  * AIH mapping: an "owner" is a configured LLM provider (empero / llamacpp /
  * zhipu / opencode …). When a provider's credential/capacity attempt fails
- * (auth 401/403 or quota exhaustion), we record that owner as degraded in a
+ * (auth rejection or quota exhaustion), we record that owner as degraded in a
  * USER-level file keyed by provider name — never in the project, never
  * silently. `aih models` / `aih doctor` / `aih status` list every degraded
  * owner with a REDACTED reason, so the user knows exactly which credential is

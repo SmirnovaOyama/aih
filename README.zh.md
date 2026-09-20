@@ -849,7 +849,7 @@ AIH 的 agent 内核是通用的，工具来自外接应用；交互终端默认
 | `remember` | 项目记忆：追加/重写 `.aih/memory.md`，跨会话持久化知识 | allow |
 | `memory_recall` | 检索项目+用户记忆：自由文本 query → 词元重叠打分返回最相关条目（零依赖，注入块被预算截断时的兜底召回） | allow |
 | `question` | 模型向用户提问并等待回答（TUI 内联问答行） | allow |
-| `webfetch` | 抓取 URL → 纯文本（HTML 转 text，64KB 截断）。浏览器级 UA + Accept 头、网络失败有界重试 1 次、Cloudflare 403 challenge 自动换诚实 UA 重试、`timeout` 参数（秒，默认 30、上限 120）、下载前 content-length 预检、失败信息可操作（提示替代端点/websearch） | allow |
+| `webfetch` | 抓取 URL → 纯文本（HTML 转 text，64KB 截断）。浏览器级 UA + Accept 头、网络失败有界重试 1 次、Cloudflare bot challenge 自动换诚实 UA 重试、`timeout` 参数（秒，默认 30、上限 120）、下载前 content-length 预检、失败信息可操作（提示替代端点/websearch） | allow |
 | `websearch` | DuckDuckGo 搜索（标题/URL/摘要，免 key） | allow |
 | `task` | 派发子代理（独立上下文、≤8 步、不可再嵌套） | allow* |
 | `apply_patch` | 多文件补丁（Add/Update/Delete/Move，opencode 格式） | ask |
@@ -992,7 +992,7 @@ AIH 现在会读取并注入项目/全局规则文件作为**强制性指令**�
 AIH 的 owner 即一个已配置的 LLM provider（`empero` / `llamacpp` / `zhipu` /
 `opencode` …）。语义：
 
-- **可隔离降级** — provider 出现凭据类失败（401/403 认证、或配额耗尽）时，该
+- **可隔离降级** — provider 出现凭据类失败（认证拒绝、或配额耗尽）时，该
   owner 被标记为不可用，在**用户级** `owner.json` 记录**脱敏**原因；原错误仍
   照常抛出（不会自动换到别的凭据）。之后的一次**成功调用会自动清除**该降级。
 - **硬失败阻止启动** — 缺少必需 API key、未知 provider、被 policy deny 的

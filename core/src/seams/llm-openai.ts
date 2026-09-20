@@ -33,7 +33,7 @@ const sidBodyCache = new Map<string, string>();
 function normalizeSid(raw: string, key: string): string {
   // The gateway validates the id FORMAT ("ses_" + 26 base62), not just the
   // prefix. aih session files are named "s-YYYYMMDD-HHMMSS" and were passed
-  // straight into x-opencode-session → every request 403'd. Remap
+  // straight into x-opencode-session → every request was rejected. Remap
   // non-conforming ids to a fresh valid body, STABLE per input (one
   // conversation = one gateway session across requests; aux calls keep their
   // own identity, P#36⑤). Templates carry the "ses_" prefix ("ses_{sid}");
@@ -105,7 +105,7 @@ export interface OpenAICompatibleOptions {
    */
   owner?: string;
   /**
-   * OC#7 — invoked when a credential-class failure (auth 401/403, or quota
+   * OC#7 — invoked when a credential-class failure (auth rejection, or quota
    * exhaustion) is observed for `owner`. The runtime NEVER auto-falls back to a
    * different credential — this hook only RECORDS the degradation (marks the
    * owner unavailable) so a report can name it; the original error still
@@ -209,6 +209,16 @@ const FIRST_TOKEN_TIMEOUT_MS = () =>
   Number(process.env.AIH_FIRST_TOKEN_TIMEOUT_MS ?? "") || 180_000;
 const STALL_TIMEOUT_MS = () =>
   Number(process.env.AIH_STALL_TIMEOUT_MS ?? "") || 60_000;
+// CC#51 — response-HEADER timeout. The stall guards above only start AFTER the
+// HTTP response headers arrive; a provider that accepts the TCP/SOCKS
+// connection but never answers the HTTP request (observed: opencode zen
+// models that time out silently — deepseek-v4-flash-free /
+// nemotron-3.5-lightning-free) would otherwise hang the fetch forever and
+// leave the TUI spinning with no turn/end. This bounds the header wait so the
+// failure folds into the (extended) network retry budget, and ultimately the
+// turn-level park cap in the agent loop. 0 disables.
+const RESPONSE_HEADER_TIMEOUT_MS = () =>
+  Number(process.env.AIH_RESPONSE_HEADER_TIMEOUT_MS ?? "") || 60_000;
 // FA#3 — reasoning-runaway watchdog. A reasoning-only stream (no content, no
 // tool call) that exceeds these budgets throws ReasoningRunawayError.
 // 0 disables a guard. Defaults: reasoning-only 120s, 16K reasoning chars.
@@ -282,15 +292,15 @@ export class OpenAICompatibleLLM implements LLMAdapter {
     const { baseUrl, apiKey, model: defaultModel } = this.#options;
     // Per-request model override (compaction FreeTierError fallback): the
     // compaction summary passes `req.model` when the primary model is
-    // contributor-gated (403 FreeTierError) so compaction survives without
-    // touching the user's active main-loop model.
+    // contributor-gated so compaction survives without touching the user's
+    // active main-loop model.
     const model = req.model ?? defaultModel;
     // opencode.ai: the gateway rejects NON-streaming requests from keyless
-    // clients as non-opencode (403 FreeTierError "can only be used from within
+    // clients as non-opencode (FreeTierError "can only be used from within
     // opencode"). The main loop always streams (AgentLoop.send injects a no-op
     // onDelta), but auxiliary calls — goal judge, best_of_n judge, MEA
     // guardian/auditor, dream distill, title, branch distill — call complete()
-    // directly without onDelta → stream:false → 403. Force streaming for
+    // directly without onDelta → stream:false → rejected. Force streaming for
     // keyless opencode.ai so EVERY path survives. A no-op onDelta still yields
     // the final text (consumeSSEStream assembles it; onDelta is only an
     // optional per-token hook), so this is safe for text-only auxiliary calls.
@@ -349,13 +359,13 @@ export class OpenAICompatibleLLM implements LLMAdapter {
     }
     // Streaming decision. Normally a request streams only when the caller asked
     // for deltas (req.onDelta). But the opencode.ai pool rejects non-streaming
-    // requests as non-opencode clients (403) — the same root cause as the
+    // requests as non-opencode clients — the same root cause as the
     // sub-agent fix. Auxiliary calls (goal judge, best_of_n, MEA
     // guardian/auditor, dream/title/branch distillation) bypass
     // AgentLoop.send()'s no-op onDelta injection, so they would emit
-    // stream:false and 403. Enforce streaming for the keyless opencode.ai
-    // case so EVERY such call is covered at the owner (the adapter decides
-    // stream:false). consumeSSEStream treats onDelta as optional (onDelta?.()),
+    // stream:false and be rejected. Enforce streaming for the keyless
+    // opencode.ai case so EVERY such call is covered at the owner (the adapter
+    // decides stream:false). consumeSSEStream treats onDelta as optional (onDelta?.()),
     // so a caller that only needs the final text still gets a fully assembled
     // response.
     const streaming =
@@ -389,7 +399,7 @@ export class OpenAICompatibleLLM implements LLMAdapter {
         // opencode.ai: a keyless client MUST still present the sentinel
         // "Bearer public" (captured from the official opencode 1.18.31 client
         // via mitmproxy). Absent the header entirely the gateway rejects with
-        // 403 FreeTierError "can only be used from within opencode"; with
+        // FreeTierError "can only be used from within opencode"; with
         // "public" it routes to the anonymous pool (or 429 when that pool is
         // exhausted). Real keys always win over the sentinel.
         const authValue = apiKey
@@ -406,9 +416,32 @@ export class OpenAICompatibleLLM implements LLMAdapter {
           },
           body: payload,
           ...(req.signal ? { signal: req.signal } : {}),
+          // CC#51 — bound the header wait. Without this a provider that
+          // accepts the connection but never answers hangs the fetch forever
+          // (TUI spins, no turn/end). A manual timer + catch below converts
+          // the timeout into a distinctive "fetch timeout" error message that
+          // NETWORK_FAILURE_RE matches, so the retry/park path owns it
+          // (AbortSignal.timeout's TimeoutError message would NOT match).
+          ...(RESPONSE_HEADER_TIMEOUT_MS() > 0
+            ? { signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(RESPONSE_HEADER_TIMEOUT_MS())]) : AbortSignal.timeout(RESPONSE_HEADER_TIMEOUT_MS()) }
+            : {}),
         });
       } catch (err) {
         if (req.signal?.aborted) throw err;
+        // CC#51 — response-header timeout: the provider accepted the
+        // connection but never answered the HTTP request. Reclassify the
+        // TimeoutError into a message NETWORK_FAILURE_RE matches ("fetch
+        // timeout …"), so it enters the extended network retry budget (and
+        // the agent-loop turn-level park cap) instead of being a fatal that
+        // kills the turn.
+        if (
+          RESPONSE_HEADER_TIMEOUT_MS() > 0 &&
+          (err as { name?: string })?.name === "TimeoutError"
+        ) {
+          lastError = new Error(`llm request failed: fetch failed (HTTP response headers not received within ${RESPONSE_HEADER_TIMEOUT_MS()}ms — provider accepted the connection but never answered)`);
+          if (attempt < attempts - 1) continue;
+          throw lastError;
+        }
         lastError = err;
         // Classify over message + cause: undici wraps every network failure
         // as "fetch failed" and hides the OS code in err.cause.

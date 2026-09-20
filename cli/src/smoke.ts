@@ -328,6 +328,37 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     const badR = await mea.runGuardianReview({ llm: fakeLlm("garbage") as never, action: "rm" });
     assert(badR.decision === "deny" && !!badR.meta, "MEA runGuardianReview: malformed → fail-closed deny");
 
+    // P#36⑤/MEA — buildGuardianReviewer onReview persists every review result
+    // to the session log as a model-invisible app/event (source
+    // "guardian/review"), so provider errors that only showed on
+    // the terminal are now visible in the JSONL.
+    {
+      const { buildGuardianReviewer } = await import("./index.js");
+      const appended: Array<{ source: string; payload: { tool: string; decision: string } }> = [];
+      const agent = buildGuardianReviewer(
+        { "no-guardian": false },
+        {
+          loop: () => ({ inject: () => {} }),
+          log: {
+            append: (e: { type: "app/event"; source: string; payload: { tool: string; decision: string } }) => {
+              appended.push(e);
+              return e;
+            },
+          },
+        },
+      );
+      assert(agent !== undefined, "MEA onReview: guardian built (no-guardian=false)");
+      agent!.onReview?.(
+        { decision: "error", meta: "llm request failed: HTTP 403 Forbidden" },
+        { tool: "run_cmd", kind: "write", args: {}, source: "tty" } as never,
+      );
+      assert(appended.length === 1, "MEA onReview: review result appended to the log");
+      assert(appended[0].source === "guardian/review", "MEA onReview: app/event source is guardian/review");
+      assert(appended[0].payload.tool === "run_cmd" && appended[0].payload.decision === "error", "MEA onReview: payload carries tool + decision (error visible)");
+      const meta = (appended[0].payload as { meta?: string }).meta;
+      assert(meta !== undefined && meta.includes("403"), "MEA onReview: provider error persisted in meta");
+    }
+
     // Circuit breaker: 3 consecutive denials interrupt, pass resets.
     const cb = new mea.GuardianCircuitBreaker();
     assert(cb.recordDenial() === false, "MEA breaker: 1 denial not tripped");
@@ -2762,8 +2793,8 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
 
   // 2) Cloudflare challenge detection
   const cfRes = new Response(null, { status: 403, headers: { "cf-mitigated": "challenge" } });
-  assert(isCloudflareChallenge(cfRes), "cf-mitigated: challenge + 403 detected");
-  assert(!isCloudflareChallenge(new Response(null, { status: 403 })), "plain 403 is not a challenge");
+  assert(isCloudflareChallenge(cfRes), "cf-mitigated: challenge detected");
+  assert(!isCloudflareChallenge(new Response(null, { status: 403 })), "plain status is not a challenge");
   assert(!isCloudflareChallenge(new Response(null, { status: 200, headers: { "cf-mitigated": "challenge" } })), "200 with header is not a challenge");
 
   // 3) actionable failure messages (FA#2: tell the model what to DO)
@@ -7754,7 +7785,7 @@ import {
 {
   // TP#2.1 — classifyProviderError
   assert(classifyProviderError(401, '{"error":"bad key"}') === "auth", "classifyProviderError: 401 → auth");
-  assert(classifyProviderError(403, '{"error":"forbidden"}') === "auth", "classifyProviderError: 403 → auth");
+  assert(classifyProviderError(403, '{"error":"forbidden"}') === "auth", "classifyProviderError: forbidden → auth");
   assert(classifyProviderError(429, '{"error":"rate limit"}') === "retryable", "classifyProviderError: 429 → retryable");
   assert(classifyProviderError(500, '{"error":"server"}') === "retryable", "classifyProviderError: 500 → retryable");
   assert(classifyProviderError(503, '{"error":"overloaded"}') === "capacity", "classifyProviderError: 503 + overloaded → capacity");
@@ -9515,13 +9546,11 @@ console.log("══════════════════════�
   assert(degrades.length === 1, "OC#7 success does not degrade anyone");
 
   // ---- {sid} normalizes to the gateway-accepted "ses_<26 base62>" id ----
-  // Live probe (2026-09-17, opencode.ai/zen/v1, full client-identity header
-  // set): "ses_s-20260905-214405" → 403 FreeTierError, "ses_<26 base62>" →
-  // 200. The gateway validates the id FORMAT, not just the prefix. aih
+  // The gateway validates the id FORMAT, not just the prefix. aih
   // session files are named "s-YYYYMMDD-HHMMSS" and were passed straight
-  // into x-opencode-session → every request 403'd. normalizeSid remaps any
-  // non-conforming id to a fresh valid body, STABLE per input (one
-  // conversation = one gateway session across requests).
+  // into x-opencode-session → every request was rejected. normalizeSid
+  // remaps any non-conforming id to a fresh valid body, STABLE per input
+  // (one conversation = one gateway session across requests).
   {
     const mk = (sessionId?: string) => {
       let captured: Record<string, string> | null = null;
@@ -9545,7 +9574,7 @@ console.log("══════════════════════�
     const d = mk();
     await d.run();
     assert(/^ses_[A-Za-z0-9]{26}$/.test(d.get()), `default "{sid}" is a valid ses_<26> id (got ${JSON.stringify(d.get())})`);
-    // 2. aih session-file id (the real-world 403 case) → remapped to valid form.
+    // 2. aih session-file id (the real-world rejection case) → remapped to valid form.
     const a = mk("s-20260905-214405");
     await a.run("s-20260905-214405");
     assert(/^ses_[A-Za-z0-9]{26}$/.test(a.get()), `malformed caller id remapped to ses_<26> (got ${JSON.stringify(a.get())})`);

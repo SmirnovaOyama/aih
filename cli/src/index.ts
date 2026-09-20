@@ -244,7 +244,7 @@ import {
   type Trace,
 } from "./measure.js";
 
-export const VERSION = "0.8.14";
+export const VERSION = "0.8.15";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );
@@ -1077,6 +1077,12 @@ export function makeSessionGate(flags: Record<string, string | boolean>): Sessio
  * AIH_GUARDIAN_FAIL_CLOSED=1; `policy` from AIH_GUARDIAN_POLICY (or default);
  * `trust` from AIH_GUARDIAN_TRUST=1 (allow is binding at any risk level).
  * `inject`/`interrupt` reach into `loop`; `onReview` surfaces a TUI row.
+ *
+ * P#36⑤-parity — `sessionId` is passed through to the reviewer LLM so the
+ * guardian's auxiliary calls share the SAME conversation-stable session
+ * identity as the main loop (x-opencode-session affinity). Without it the
+ * guardian used a per-instance random id, which can diverge from the main
+ * loop's routing/prompt-cache session and surface as provider-side denials.
  */
 export function buildGuardianReviewer(
   flags: Record<string, string | boolean>,
@@ -1084,6 +1090,9 @@ export function buildGuardianReviewer(
     loop: () => { inject(text: string): void } | null;
     tui?: () => { pushSystem(text: string): void } | null;
     llm?: () => ReturnType<typeof buildLlm> | null;
+    sessionId?: string;
+    /** MEA — session log for persisting review results (guardian/review event). */
+    log?: { append(event: { type: "app/event"; source: string; payload: unknown }): unknown };
   },
 ): GuardianReviewer | undefined {
   if (bool(flags, "no-guardian") || process.env.AIH_GUARDIAN === "0") return undefined;
@@ -1094,7 +1103,10 @@ export function buildGuardianReviewer(
     llm: () => {
       if (refs.llm) return refs.llm();
       try {
-        return buildLlm(flags);
+        // P#36⑤-parity — share the main loop's conversation-stable session
+        // identity so the guardian's review calls route under the same
+        // x-opencode-session as the agent's own calls.
+        return buildLlm(flags, refs.sessionId);
       } catch {
         return null; // no model → Guardian disabled (human fallback)
       }
@@ -1113,6 +1125,20 @@ export function buildGuardianReviewer(
       refs.tui?.()?.pushSystem(`[guardian] ⛔ ${reason}`);
     },
     onReview: (r, req) => {
+      // MEA — persist every review result to the session log as an
+      // app/event (model-invisible), so denial/error outcomes are visible
+      // in the JSONL instead of only on the terminal. `decision:"error"`
+      // carries the raw provider error in meta.
+      refs.log?.append({
+        type: "app/event",
+        source: "guardian/review",
+        payload: {
+          tool: req.tool,
+          decision: r.decision,
+          meta: r.meta,
+          elapsedMs: r.elapsedMs,
+        },
+      });
       const tui = refs.tui?.();
       if (!tui) {
         process.stderr.write(`[guardian] ${req.tool} → ${r.decision}${r.meta ? ` (${r.meta})` : ""}\n`);
@@ -1696,7 +1722,13 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
     });
 
     // MEA — write-action Guardian reviewer for this one-shot run (default-on).
-    const guardian = buildGuardianReviewer(flags, { loop: () => loop });
+    const guardian = buildGuardianReviewer(flags, {
+      loop: () => loop,
+      // P#36⑤-parity — same session identity as the main loop.
+      sessionId: sessionPath ? basename(sessionPath).replace(/\.jsonl$/, "") : undefined,
+      // MEA — persist review results (guardian/review app/event) to the log.
+      log,
+    });
     if (guardian) gate.setGuardian(guardian);
 
     // P1#4: BM25 relevance auto-loading — nudge the model toward a clearly
@@ -2020,7 +2052,13 @@ async function cmdWorkflow(
         ...(safety ? { budget: safety.budget, costOf: safety.costOf, sensors: safety.sensors, onTripwire: safety.onTripwire, onEscalate: safety.onEscalate } : {}),
       });
       // MEA — write-action Guardian reviewer for this workflow run (default-on).
-      const guardian = buildGuardianReviewer(flags, { loop: () => loop });
+      const guardian = buildGuardianReviewer(flags, {
+        loop: () => loop,
+        // P#36⑤-parity — same session identity as the main loop.
+        sessionId: sessionPath ? basename(sessionPath).replace(/\.jsonl$/, "") : undefined,
+        // MEA — persist review results (guardian/review app/event) to the log.
+        log,
+      });
       if (guardian) gate.setGuardian(guardian);
       const send = async (prompt: string): Promise<string> => {
         const result = await loop.send(prompt);
@@ -2272,7 +2310,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         repObs,
         {
           // Surface a failed compaction in the TUI instead of only stderr: a
-          // bloated-but-never-compacting session (summary LLM quota 403 /
+          // bloated-but-never-compacting session (summary LLM denial /
           // empty summary) used to be invisible — the usage panel climbed
           // past the window with no hint why. Now the user sees the reason
           // and can retry /compact after the quota resets.
@@ -2311,6 +2349,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   const guardian = buildGuardianReviewer(flags, {
     loop: () => loop,
     tui: () => tuiRef.current,
+    // P#36⑤-parity — same session identity as the main loop.
+    sessionId: sessionPath ? basename(sessionPath).replace(/\.jsonl$/, "") : undefined,
+    // MEA — persist review results (guardian/review app/event) to the log.
+    log,
   });
   if (guardian) gate.setGuardian(guardian);
   const streaming = !bool(flags, "no-stream") && !bool(flags, "mock");
@@ -4454,6 +4496,11 @@ async function cmdChat(flags: Record<string, string | boolean>) {
           '⚠ model output hit its token ceiling mid-turn — partial step not executed; send a message (e.g. "continue") to resume',
         );
       }
+      if (result.stopReason === "network_exhausted") {
+        tui.pushSystem(
+          '⚠ network retries exhausted — the provider did not answer after multiple attempts (check the model/endpoint, or switch with /model); send a message to retry',
+        );
+      }
       await runGoalCheck();
       void ensureTitle();
     } catch (err) {
@@ -5444,10 +5491,10 @@ async function cmdConfig(flags: Record<string, string | boolean>) {
           value: llm.contextWindow.value !== undefined ? Number(llm.contextWindow.value) : undefined,
           effective: resolveContextWindow(flags),
         },
-        // Real-machine diagnosis (2026-09-19 compact-403): show the RESOLVED
-        // identity headers the runtime will send, plus the provider's raw
-        // headers/keyless — a stale config.json (never overwritten by the
-        // installer) is the top suspect for "normal OK / compact 403".
+        // Real-machine diagnosis: show the RESOLVED identity headers the
+        // runtime will send, plus the provider's raw headers/keyless — a
+        // stale config.json (never overwritten by the installer) is the top
+        // suspect for "normal OK / compact denied".
         providerDiagnostics: {
           headers: Object.keys(llm.headers ?? {}),
           keyless: llm.keyless === true,

@@ -698,8 +698,7 @@ assert(retryRes.genMs === undefined, "non-streaming response carries no genMs (F
   await sidLlm.complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
   await sidLlm.complete({ messages: [{ role: "user", content: "hi" }], tools: [], sessionId: "aih-compact-x" });
   // normalizeSid: malformed ids (aih session-file names like "s-YYYYMMDD-HHMMSS")
-  // are remapped to the gateway-accepted "ses_<26 base62>" form (live probe:
-  // "ses_s-20260905-214405" → 403 FreeTierError, "ses_<26>" → 200). The
+  // are remapped to the gateway-accepted "ses_<26 base62>" form. The
   // mapping is STABLE per input (one conversation = one gateway session) and
   // per-request sessionId (compaction side-channel) gets its OWN id.
   const VALID_SID = /^ses_[A-Za-z0-9]{26}$/;
@@ -737,7 +736,7 @@ assert(retryRes.genMs === undefined, "non-streaming response carries no genMs (F
 // Zenfree sentinel regression (2026-09-19): a KEYLESS client hitting
 // *.opencode.ai must send `Authorization: Bearer public` (the identity
 // sentinel captured from the real opencode 1.18.31 client via mitmproxy).
-// Absent the header the gateway 403s with FreeTierError. Real keys win;
+// Absent the header the gateway rejects with FreeTierError. Real keys win;
 // non-opencode.ai endpoints stay headerless; remote non-opencode hosts never
 // get the sentinel (no credential spill to lookalike hosts).
 {
@@ -2902,6 +2901,35 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
     assert(deadCalls === 3, `park attempts bounded (got ${deadCalls}, want 3 = 1 + 2 waits)`);
     const deadWaits = deadLog.all().filter((e) => e.type === "quota_wait" && (e as { reason?: string }).reason === "network").length;
     assert(deadWaits === 2, `park waits logged (got ${deadWaits})`);
+  }
+
+  // 7b) CC#51 — network park budget exhausted WITHOUT a fresh retry between
+  //   while iterations must end the turn with "network_exhausted", not loop
+  //   forever across iterations. Simulates a provider that times out on EVERY
+  //   call (adapter retries + park waits all fail): the turn-level cumulative
+  //   cap stops the spin.
+  {
+    const prevPark = process.env.AIH_NETWORK_PARK_MS;
+    process.env.AIH_NETWORK_PARK_MS = "5,5,5"; // fast 3-tier test waits
+    try {
+      let calls = 0;
+      const hangLlm: LLMAdapter = {
+        async complete(): Promise<LLMResponse> {
+          calls += 1;
+          throw new Error("llm request failed: fetch failed (HTTP response headers not received within 1000ms — provider accepted the connection but never answered)");
+        },
+      };
+      const hangLog = new SessionLog();
+      const hangLoop = new AgentLoop({ llm: hangLlm, tools: quotaTools, log: hangLog });
+      const hangRes = await hangLoop.send("explain");
+      assert(hangRes.stopReason === "network_exhausted", `turn-level network cap ends turn (stopReason=${hangRes.stopReason})`);
+      assert(calls === 4, `adapter calls bounded by turn-level park cap (got ${calls}, want 4 = 1 + 3 park retries)`);
+      const hangWaits = hangLog.all().filter((e) => e.type === "quota_wait" && (e as { reason?: string }).reason === "network");
+      assert(hangWaits.length === 3, `network park waits capped at MAX_NETWORK_PARK_WAITS (got ${hangWaits.length})`);
+    } finally {
+      if (prevPark === undefined) delete process.env.AIH_NETWORK_PARK_MS;
+      else process.env.AIH_NETWORK_PARK_MS = prevPark;
+    }
   }
 
   // 8) A NON-network failure is not parked (fatal errors still kill the turn

@@ -7,6 +7,19 @@ description: AIH 版本更新日志 —— 0.8.x / 0.7.x / 0.6.x / 0.5.x 的主�
 
 完整逐条记录见仓库 [`CHANGELOG.md`](https://github.com/summit4you/aih/blob/main/CHANGELOG.md)（Keep a Changelog 格式，SemVer 版本）。本页为各版本要点摘要。
 
+## 0.8.15（2026-09-20）
+
+**新增**
+
+- **LLM 请求支持 SOCKS5 代理** — 配置 `proxy.socks5` / `AIH_SOCKS5_PROXY` 后，LLM API 调用可经 SOCKS5 隧道转发（自托管网络、企业出口、支持地区出口）；`buildRealLlm` 注入 `socksFetch` 实现的 `fetchImpl`，任意 provider 的请求都能走隧道，核心零改动。
+- **`/socks` 运行时开关** — 不重启即可切换 LLM SOCKS5 代理：裸 `/socks` 翻转状态（on⇄off），`/socks on|off` 显式设置；`socksOverride` 门控 `fetchImpl` 注入（off 时即使 `aih.json` 有 `proxy.socks5` 也强制直连），TUI 状态行显示 `SOCKS on` / `SOCKS off` 指示。
+
+**修复**
+
+- **agent 循环网络恢复有界化** — 某些 provider 接受连接后永不响应（静默超时）会让每条用户消息空转数分钟、且下一条消息重新烧掉整个重试预算；现引入按轮次累计的 park 上限，超限即以专用 `network_exhausted` stopReason 诚实结束该轮而非挂死，TUI 显示清晰的"网络重试已用尽"提示。
+- **适配层响应头超时** — provider 接受 TCP/SOCKS 连接后永不返回 HTTP 头会让 fetch 永久挂起（TUI 空转、无 `turn/end`）；现加 `RESPONSE_HEADER_TIMEOUT_MS` 守卫（默认 60s，`0` 关闭），把等待纳入网络重试预算与轮次上限。
+- **Guardian 评审会话一致性 + 事件落盘** — Guardian 的辅助评审 LLM 现与主循环共享会话稳定的身份（`run` / `workflow` / TUI `chat` 三处调用点），不再分叉到 per-instance 随机 id；每次评审结果落盘为模型不可见的 `app/event`（`source: "guardian/review"`），拒绝/错误结果在 JSONL 可见而非仅终端一行。
+
 ## 0.8.14（2026-09-20）
 
 **新增**
@@ -15,7 +28,7 @@ description: AIH 版本更新日志 —— 0.8.x / 0.7.x / 0.6.x / 0.5.x 的主�
 
 **变更**
 
-- **辅助 LLM 调用统一在适配层走流式** — goal judge、`best_of_n`、MEA guardian/auditor、dream/title/branch 蒸馏、压缩摘要等绕过主循环流式的旁路调用，此前发 `stream:false` 被只接受流式的网关拒绝（403）；现由适配层统一决定流式，每条旁路都覆盖，最终文本仍完整拼装，调用方无感知。
+- **辅助 LLM 调用统一在适配层走流式** — goal judge、`best_of_n`、MEA guardian/auditor、dream/title/branch 蒸馏、压缩摘要等绕过主循环流式的旁路调用，此前发 `stream:false` 被只接受流式的网关拒绝；现由适配层统一决定流式，每条旁路都覆盖，最终文本仍完整拼装，调用方无感知。
 - **离线包默认配置改为"净版"** — 打包默认配置不再携带任何 provider / 模型 / 代理，安装后由用户自行配置端点（`aih connect` / `aih config` / `aih.json`）；构建机本地的 `aih.json`（provider、模型、代理、内网端点）被剥离而非合并，杜绝机器本地信息泄漏进安装包。
 - **全新安装启动引导** — 未配置任何 provider 时，`aih run` / `aih chat` 不再报晦涩的"no API key"/"no model id"，而是引导用户 `aih connect`（浏览目录）或在 `aih.json` 加 provider；自托管 / 免 key 端点无需密钥，`--mock` 可离线演示。
 

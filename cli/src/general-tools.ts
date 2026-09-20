@@ -222,12 +222,12 @@ function htmlToText(html: string): { title: string; text: string } {
 // ── webfetch hardening (opencode/MiMo `tool/webfetch.ts` parity) ─────────────
 // The old implementation was one-shot: a single 20s fetch with a bot UA, no
 // retries, no Accept header, body downloaded before the size check, and bare
-// error text ("webfetch failed: HTTP 403") that told the model nothing it
-// could act on. In flaky networks that turned every transient blip into a
+// error text ("webfetch failed: HTTP <status>") that told the model nothing
+// it could act on. In flaky networks that turned every transient blip into a
 // visible failure. The seam below fixes that with zero new dependencies:
 //   1. browser-grade UA + Accept/Accept-Language headers (bot-block resistance)
 //   2. one bounded retry on network failures (connect/DNS/TLS/abort)
-//   3. Cloudflare 403 + `cf-mitigated: challenge` → honest-UA retry (opencode)
+//   3. Cloudflare bot challenge (`cf-mitigated: challenge`) → honest-UA retry (opencode)
 //   4. configurable timeout: arg (s) > AIH_FETCH_TIMEOUT_MS > 30s, cap 120s
 //   5. content-length precheck before downloading the body
 //   6. actionable failure messages (FA#2 principle: tell the model what to DO)
