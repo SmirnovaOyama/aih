@@ -2,6 +2,7 @@ import { accent, bold, blue, cyan, danger, dim, gradientText, green, italic, mag
 import type { DiffLine } from "./diff.js";
 import { capDiff } from "./diff.js";
 import type { KeybindAction } from "./keybinds.js";
+import { copyToClipboard } from "./clipboard.js";
 import stringWidth from "string-width";
 
 export interface TodoItem {
@@ -815,6 +816,21 @@ export class Tui {
    * keyboard path. Default = the most recently rendered tool unit.
    */
   #focusUnit = -1;
+
+  /**
+   * Text selection (opencode/mimo parity): left-drag on the transcript selects
+   * a rectangular cell range [anchor → drag end]; Ctrl+C copies the selected
+   * visible text to the system clipboard; Esc clears it. Coordinates are
+   * SCREEN (1-based row/col) so the paint diff can highlight exactly the
+   * selected cells regardless of scroll; the copy path maps them back to the
+   * visible body rows.
+   */
+  #selAnchor: { r: number; c: number } | null = null;
+  /** Release endpoint (last drag position) — kept so #selectedText can build
+   *  the per-row drag-corner rectangle (each row spans its edge col). */
+  #selRelease: { r: number; c: number } | null = null;
+  #sel: { r0: number; c0: number; r1: number; c1: number } | null = null;
+  #selDragging = false;
   /**
    * Legacy Windows console (conhost, no WT_SESSION/TERM_PROGRAM): mouse
    * tracking works (Win10+), but bracketed paste is unreliable and GBK
@@ -1747,6 +1763,16 @@ constructor(opts: TuiOptions) {
   #lastSeqAt = 0;
 
   #doubleEsc(): void {
+    // opencode/mimo parity — Esc clears a text selection (keeps the composer
+    // and the turn untouched); without a selection it is the cancel gesture.
+    if (this.#sel) {
+      this.#sel = null;
+      this.#selAnchor = null;
+      this.#selRelease = null;
+      this.#selDragging = false;
+      this.requestPaint();
+      return;
+    }
     const wasBusy = this.#opts.busy();
     this.#edit = "";
     this.#cursor = 0;
@@ -1985,6 +2011,16 @@ constructor(opts: TuiOptions) {
         this.#qbuf = this.#qbuf.slice(0, -1);
         this.requestPaint();
       } else if (ch >= " ") {
+        // Bugfix (2026-09-19, user report): with a choice list open, typing
+        // used to append to a buffer that was never rendered as the answer
+        // target — Enter then submitted the SELECTED OPTION and the typed
+        // text vanished ("选 Other 直接就提交了，没回到输入区"). opencode
+        // parity: any printable key while a choice list is open switches to
+        // free-text editing and THE SAME keystroke seeds the answer, so the
+        // user lands in the input area immediately.
+        if (done.options && !done.custom && this.#qbuf === "") {
+          this.#question = { ...done, custom: true, sel: done.options.length };
+        }
         this.#qbuf += ch;
         this.requestPaint();
       }
@@ -2091,6 +2127,18 @@ constructor(opts: TuiOptions) {
         return;
       }
       case "\x03":
+        // opencode/mimo parity — Ctrl+C copies a text selection when one
+        // exists; the turn-cancel / exit semantics apply only without one.
+        if (this.#sel) {
+          const text = this.#selectedText();
+          this.#sel = null;
+          this.#selAnchor = null;
+          this.#selRelease = null;
+          this.#selDragging = false;
+          this.requestPaint();
+          if (text) this.#copyText(text);
+          return;
+        }
         if (!this.#edit) {
           if (this.#opts.busy()) {
             this.pushSystem("turn cancelled");
@@ -2191,7 +2239,19 @@ constructor(opts: TuiOptions) {
           this.#held = "";
           this.#escAt = 0;
           // A LONE Esc (no sequence continuation within the noise window) is a
-          // deliberate keystroke, not terminal noise. While a turn is busy it
+          // deliberate keystroke, not terminal noise. If a text selection is
+          // live, clear it first (opencode/mimo selection handler: escape →
+          // clearSelection) — this must beat the busy-cancel so the user can
+          // dismiss a highlight without killing a running turn.
+          if (this.#sel) {
+            this.#sel = null;
+            this.#selAnchor = null;
+            this.#selRelease = null;
+            this.#selDragging = false;
+            this.requestPaint();
+            return;
+          }
+          // While a turn is busy it
           // is the cancel gesture — requiring Esc-Esc made interrupting a
           // runaway turn feel like "press Esc a dozen times" (the double-Esc
           // gate also ate presses after a mouse/scroll burst bumped
@@ -2306,14 +2366,67 @@ constructor(opts: TuiOptions) {
       const m = /^<(\d+);(\d+);(\d+)([Mm])$/.exec(kind);
       if (m) {
         const button = Number(m[1]);
+        const col = Number(m[2]);
         const row = Number(m[3]);
+        const down = m[4] === "M";
         if (button === 64 || button === 4) {
           this.#sgrWheelSeen = true;
           this.#scrollBy(-3);
         } else if (button === 65 || button === 5) {
           this.#sgrWheelSeen = true;
           this.#scrollBy(3);
-        } else if (m[4] === "M" && button === 0) this.#clickAt(row);
+        } else if (down && button === 0) {
+          // Left-button press: anchor a text selection (opencode/mimo — drag
+          // to select transcript text, Ctrl+C copies it). The mouse tracking
+          // mode ?1006h is already on; SGR move events (button 32 while held,
+          // or button 35 without button state) update the drag end.
+          this.#selAnchor = { r: row, c: col };
+          this.#sel = { r0: row, c0: col, r1: row, c1: col };
+          this.#selDragging = true;
+          this.requestPaint();
+        } else if (this.#selDragging && !down && button === 0) {
+          // Left-button release: end the drag. BUGFIX (2026-09-19, user
+          // report): a zero-size release (press+release without moving) used
+          // to leave a 1-cell "selection" behind AND never reach #clickAt,
+          // so after entering selection mode a plain click could not expand
+          // a tool block anymore. A click without drag is NOT a selection
+          // gesture: clear it and fall through to the click handler, exactly
+          // like the non-dragging click path below. A real drag keeps the
+          // selection for Ctrl+C copy as before.
+          this.#selDragging = false;
+          if (this.#sel && this.#sel.r0 === row && this.#sel.c0 === col) {
+            this.#sel = null;
+            this.#selAnchor = null;
+            this.#selRelease = null;
+            this.#clickAt(row);
+          }
+          this.requestPaint();
+        } else if (this.#selDragging && (button === 32 || button === 35)) {
+          // Drag (button1 held = 32) or motion (35): extend the selection.
+          // The column window MONOTONICALLY WIDENS (opencode parity): a drag
+          // right then down keeps the start row's swept width even when a
+          // later motion goes to a narrower column — the rectangle never
+          // shrinks, so the copied text keeps every col the cursor covered.
+          // (Overwriting with only the latest endpoint lost the sweep: copy
+          // came back "  hel" instead of "  hello w".)
+          const a = this.#selAnchor!;
+          const prevC0 = this.#sel ? Math.min(this.#sel.c0, this.#sel.c1) : a.c;
+          const prevC1 = this.#sel ? Math.max(this.#sel.c0, this.#sel.c1) : a.c;
+          const r0n = Math.min(a.r, row);
+          const r1n = Math.max(a.r, row);
+          const c0n = Math.min(prevC0, col);
+          const c1n = Math.max(prevC1, col);
+          this.#selRelease = { r: row, c: col };
+          this.#sel = { r0: r0n, c0: c0n, r1: r1n, c1: c1n };
+          this.requestPaint();
+        } else if (!down && !button && !this.#selDragging) {
+          // Click without drag: not a selection gesture — clear any stale
+          // selection and fall through to the click handler below.
+          this.#sel = null;
+          this.#clickAt(row);
+        } else if (down && button !== 0) {
+          // Any other button (middle/right) — ignore for selection.
+        }
       }
       return;
     }
@@ -2891,7 +3004,7 @@ constructor(opts: TuiOptions) {
     const t = g.items[0].tool!;
     const icon = TOOL_ICONS[t.name] ?? "⚙";
     if (!this.#groupOpen.get(g.start)) {
-      return [this.#clip(`${icon} ${paint(t.name, "38;5;75")} ×${g.items.length}${muted("   enter to expand")}`, this.#bodyCols())];
+      return [this.#clip(`${icon} ${paint(t.name, "38;5;75")} × ${g.items.length}${muted("   enter to expand")}`, this.#bodyCols())];
     }
     const rows = g.items.flatMap((it) => this.#toolRow(it));
     rows.push(this.#clip(muted("   enter to collapse"), this.#bodyCols()));
@@ -3044,6 +3157,22 @@ constructor(opts: TuiOptions) {
     return this.#lastLines.map(strip);
   }
 
+  /** Test hook: the last painted frame RAW (ANSI kept) — selection REV is
+   *  \x1b[7m, which frameForTest strips; this exposes it for assertions. */
+  rawFrameForTest(): string[] {
+    return [...this.#lastLines];
+  }
+
+  /** Test hook: the current text selection (screen cell range or null). */
+  selectionForTest(): { r0: number; c0: number; r1: number; c1: number } | null {
+    return this.#sel ? { ...this.#sel } : null;
+  }
+
+  /** Test hook: the extracted selected text (same code Ctrl+C uses). */
+  selectedTextForTest(): string {
+    return this.#selectedText();
+  }
+
   /** Test hook — scroll pinning state for sticky-scroll smoke assertions. */
   scrollStateForTest(): { scrollTop: number; pinned: boolean; contentLines: number } {
     return { scrollTop: this.#scrollTop, pinned: this.#pinned, contentLines: this.#contentLines() };
@@ -3096,7 +3225,7 @@ constructor(opts: TuiOptions) {
       if (typeof ctx.cacheRate === "number") {
         lines.push(muted(`CH ${Math.round(ctx.cacheRate * 100)}%`));
       }
-      if (pct >= 80) lines.push(warn("▲ compact soon (auto ≥80%)"));
+      if (pct >= 80) lines.push(warn("▲ compact soon (auto ≥ 80%)"));
     }
     const todos = this.#panelTodos();
     // Show the list even when fully completed (grayed ✓ rows) — the user
@@ -3685,7 +3814,7 @@ constructor(opts: TuiOptions) {
     else hint = "? help · /commands · ctrl-p palette · tab complete";
     // Scroll-back indicator (used to ride the now-removed dashed separator
     // row): shown on the hints row when scrolled up from the bottom.
-    const tag = this.#scrollTop > 0 ? `  ↑${this.#scrollTop}` : "";
+    const tag = this.#scrollTop > 0 ? `  ↑ ${this.#scrollTop}` : "";
     // The aih version + cwd path used to lead this row, but they now live in the
     // sidebar footer (bottom-aligned, opencode/mimo-code parity) — keeping them
     // here too would duplicate. This row is now purely the actionable hint +
@@ -3735,6 +3864,120 @@ constructor(opts: TuiOptions) {
     const r = this.#opts.statusRight ? muted(this.#opts.statusRight) : "";
     const pad = Math.max(1, width - cols(l) - cols(r) - 1);
     return this.#clip(`${l}${" ".repeat(Math.min(pad, 200))}${r}`, width);
+  }
+
+  /**
+   * opencode/mimo parity — Ctrl+C copy of the selected transcript text.
+   * The selection is a SCREEN cell range; map it to the visible body rows
+   * (body row i = screen row i+1, since #paint lays body rows first), then
+   * strip ANSI and extract the cell columns between c0..c1 inclusive (the
+   * whole row when the selection spans it).
+   */
+  #selectedText(): string {
+    const sel = this.#sel;
+    if (!sel) return "";
+    const r0 = Math.min(sel.r0, sel.r1);
+    const r1 = Math.max(sel.r0, sel.r1);
+    const c0 = Math.min(sel.c0, sel.c1);
+    const c1 = Math.max(sel.c0, sel.c1);
+    // Rebuild the visible body rows the same way #paint does (already styled
+    // strings, not yet padded/guarded) so the column mapping is exact.
+    const units = this.#units();
+    const body: string[] = [];
+    let first = true;
+    units.forEach((u, ui) => {
+      const lines = u.kind === "item" ? this.#block(u.item) : this.#groupLines(u);
+      if (!first && lines.length) body.push("");
+      first = false;
+      for (const r of lines) body.push(r);
+    });
+    const bodyCols = this.#bodyCols();
+    // The selection is a rectangle over [r0..r1] × [c0..c1]: the drag-extend
+    // handler widens the column window monotonically (union of every motion
+    // from the anchor), so every selected row copies the FULL swept width —
+    // an earlier per-endpoint rule collapsed single-row drags to one char
+    // (copy returned "") and multi-row drags to the narrowest col seen.
+    const lines: string[] = [];
+    for (let r = r0; r <= r1; r += 1) {
+      const bi = r - 1 + this.#scrollTop;
+      const raw = body[bi] ?? "";
+      if (bi < 0 || bi >= body.length) continue;
+      // Strip ANSI to get the visible text, then slice by display columns.
+      const plain = raw.replace(/\x1b\[[0-9;]*m/g, "");
+      const cluster: string[] = [];
+      let n = 0;
+      for (const ch of plain) {
+        const w = width(ch);
+        if (n + w > bodyCols) break;
+        cluster.push(ch);
+        n += w;
+      }
+      const line = cluster.join("");
+      const left = Math.min(c0 - 1, line.length);
+      const right = Math.min(c1, line.length); // inclusive
+      lines.push(line.slice(left, right).trimEnd());
+    }
+    // opencode parity: multi-line copy joins rows and trims trailing
+    // whitespace per line; blank spacer rows (block gaps) collapse out.
+    return lines.filter((l) => l.length > 0 || lines.length === 1).join("\n");
+  }
+
+  /** Copy text to the system clipboard; report via a system row (never throws). */
+  #copyText(text: string): void {
+    const res = copyToClipboard(text);
+    if (res.ok) {
+      this.pushSystem(`copied ${text.length} chars to clipboard (${res.via})`);
+    } else {
+      this.pushSystem(`no clipboard available — selected text:\n${text}`);
+    }
+  }
+
+  /**
+   * Reverse-video highlight the selection cells inside a single styled body
+   * row. `line` is the styled string; returns it with the selected column
+   * range wrapped in REV … RESET. The selection is rectangular, so each row
+   * between r0..r1 may carry a partial highlight.
+   */
+  #highlightSel(line: string, screenRow: number): string {
+    const sel = this.#sel;
+    if (!sel || !line) return line;
+    const r0 = Math.min(sel.r0, sel.r1);
+    const r1 = Math.max(sel.r0, sel.r1);
+    if (screenRow < r0 || screenRow > r1) return line;
+    const c0 = Math.min(sel.c0, sel.c1);
+    const c1 = Math.max(sel.c0, sel.c1);
+    // Walk the styled string; collect the visible (non-SGR) prefix up to c0,
+    // the selected slice up to c1, and the tail.
+    let pre = "";
+    let bodySel = "";
+    let tail = "";
+    let n = 0;
+    let i = 0;
+    let inSel = false;
+    const tokens = line.split(/(\x1b\[[0-9;]*m)/).filter((x) => x !== "");
+    for (const tk of tokens) {
+      if (/^\x1b\[[0-9;]*m$/.test(tk)) {
+        const holder = inSel ? bodySel : pre;
+        (inSel ? (bodySel = holder + tk) : (pre = holder + tk));
+        continue;
+      }
+      for (const ch of tk) {
+        const w = width(ch);
+        if (!inSel && n + w > c0) {
+          // entering selection somewhere inside this character run
+          inSel = true;
+        }
+        if (!inSel) {
+          pre += ch;
+        } else if (n + w <= c1 + 1) {
+          bodySel += ch;
+        } else {
+          tail += ch;
+        }
+        n += w;
+      }
+    }
+    return `${pre}${REV}${bodySel}${RESET}${tail}`;
   }
 
   /**
@@ -3954,7 +4197,10 @@ constructor(opts: TuiOptions) {
       // the first arg of row() trips a TS5.9 private-call + trailing-arg parse
       // quirk (TS2554 "expected 2 got 1") even though it is type-correct.
       const clipped = this.#clip(body[this.#scrollTop + i] ?? "", leftW);
-      rows.push(row(clipped));
+      // Text selection (opencode/mimo parity): reverse-video highlight the
+      // selected cells. Body row i is screen row i+1 (body rows come first in
+      // #paint), which is what the SGR mouse coordinates report.
+      rows.push(row(this.#sel ? this.#highlightSel(clipped, i + 1) : clipped));
     }
 
     if (this.#ov()) {

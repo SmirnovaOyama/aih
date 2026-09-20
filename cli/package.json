@@ -18,7 +18,8 @@
   "dependencies": {
     "@aih/core": "0.7.2",
     "@modelcontextprotocol/sdk": "^1.17.0",
-    "string-width": "^7.2.0"
+    "string-width": "^7.2.0",
+    "undici": "^8.10.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

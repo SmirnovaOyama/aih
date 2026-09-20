@@ -2818,6 +2818,84 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
     assert("timeout" in props, "webfetch exposes a timeout argument");
     assert(String(wf.description).includes("retry"), "webfetch description documents the retry behavior");
   }
+  // 8) socks5 proxy: config resolution + a real tunnel round-trip
+  {
+    const { resolveSocksProxy, socksFetch } = await import("./socks-proxy.js");
+    const net = await import("node:net");
+    const http = await import("node:http");
+
+    // env override wins over config
+    assert(
+      resolveSocksProxy({ socks5: "1.2.3.4:1080" }, { AIH_SOCKS5_PROXY: "9.9.9.9:1081" })?.socks5 === "9.9.9.9:1081",
+      "socks: env AIH_SOCKS5_PROXY overrides config",
+    );
+    // config endpoint used when no env
+    assert(
+      resolveSocksProxy({ socks5: "1.2.3.4:1080" }, {})?.socks5 === "1.2.3.4:1080",
+      "socks: config endpoint honored when env unset",
+    );
+    // nothing configured → undefined (webfetch falls back to direct)
+    assert(resolveSocksProxy(undefined, {}) === undefined, "socks: unset → undefined");
+
+    // minimal SOCKS5 (no-auth, CONNECT) server + target, prove the tunnel carries the request
+    const target = http.createServer((q, s) => {
+      s.writeHead(200, { "content-type": "text/plain" });
+      s.end(`SOCKS-TUNNEL-OK ua=${q.headers["user-agent"]}`);
+    });
+    await new Promise<void>((r) => target.listen(0, "127.0.0.1", r));
+    const targetPort = (target.address() as { port: number }).port;
+    const saw: { host: string; port: number } = { host: "", port: 0 };
+    const srv = net.createServer((sock) => {
+      let buf = Buffer.alloc(0);
+      let phase = "greet";
+      sock.on("data", (d: Buffer) => {
+        buf = Buffer.concat([buf, d]);
+        if (phase === "greet") {
+          if (buf.length < 2) return;
+          if (buf[0] !== 5) return sock.destroy();
+          const n = buf[1];
+          if (buf.length < 2 + n) return;
+          sock.write(Buffer.from([5, 0]));
+          buf = buf.subarray(2 + n);
+          phase = "req";
+        }
+        if (phase === "req") {
+          if (buf.length < 4) return;
+          const cmd = buf[1];
+          const atyp = buf[3];
+          let off = 4;
+          let host: string;
+          if (atyp === 1) { host = Array.from(buf.subarray(4, 8)).join("."); off = 8; }
+          else if (atyp === 3) { const l = buf[4]; if (buf.length < 5 + l) return; host = buf.subarray(5, 5 + l).toString(); off = 5 + l; }
+          else if (atyp === 4) { if (buf.length < 20) return; host = buf.subarray(4, 20).toString("hex"); off = 20; }
+          else return sock.destroy();
+          if (buf.length < off + 2) return;
+          const port = buf.readUInt16BE(off);
+          off += 2;
+          if (cmd !== 1) { sock.write(Buffer.from([5, 7, 0, 1, 0, 0, 0, 0, 0, 0])); return sock.end(); }
+          saw.host = host;
+          saw.port = port;
+          sock.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+          buf = buf.subarray(off);
+          phase = "tunnel";
+          const up = net.connect(port, host, () => { if (buf.length) up.write(buf); sock.pipe(up); up.pipe(sock); });
+          up.on("error", () => sock.end());
+          sock.on("error", () => up.end());
+          return;
+        }
+      });
+    });
+    await new Promise<void>((r) => srv.listen(10999, "127.0.0.1", r));
+    try {
+      const res = (await socksFetch(`http://127.0.0.1:${targetPort}/hi`, { headers: { "user-agent": "smoke/1" } }, { socks5: "127.0.0.1:10999" })) as Response;
+      const text = await res.text();
+      assert(res.status === 200 && text.includes("SOCKS-TUNNEL-OK") && text.includes("ua=smoke/1"), "socks: request routed through tunnel");
+      assert(saw.host === "127.0.0.1" && saw.port === targetPort, "socks: proxy saw CONNECT to the real target");
+    } finally {
+      srv.close();
+      target.close();
+    }
+  }
   rmSync(workdir, { recursive: true, force: true });
 }
 
@@ -3964,6 +4042,48 @@ await srv.connect(new StdioServerTransport());
     `question options: ci lands on the input row after the gaps (got ci=${il.ci}, expect ${nOpts + 3})`,
   );
   console.log("ok: question options (opencode parity) — ↑↓/Enter/digit/Esc/other/Ctrl-C/rendering");
+}
+
+{
+  // REGRESSION (2026-09-19, user report): with a choice list open, typing
+  // used to append to a buffer that Enter did NOT submit — Enter confirmed
+  // the SELECTED OPTION and the typed text vanished, looking like "选 Other
+  // 直接就提交了，没回到输入区". Fix: any printable key while the list is
+  // open switches to free-text custom mode; the FIRST typed keystroke seeds
+  // the answer (same key both switches and types, opencode parity).
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const race = (p: Promise<string>) =>
+    Promise.race([p, new Promise((r) => setTimeout(() => r("TIMEOUT"), 400))]);
+  // Type directly while the list is open (no ⌫-to-options, no Esc first):
+  // "other" selected? NO — the user just types. The first char must flip to
+  // custom mode and land in the answer buffer.
+  let p = tui.askQuestion("Which? ", ["A", "B", "C"]);
+  tui.feed("mine\r");
+  assert((await race(p)) === "mine", `question: typing with list open → free-text seeded by the first key (got TIMEOUT/fell through)`);
+  // Enter with typed text submits THAT TEXT, never option "A" (the old bug).
+  p = tui.askQuestion("Which? ", ["A", "B", "C"]);
+  tui.feed("hello world\r");
+  assert((await race(p)) === "hello world", `question: typed Enter submits the typed text, not the highlighted option`);
+  // Number keys still pick options DIRECTLY (1-based) — typing a digit must
+  // NOT be swallowed into free-text mode.
+  p = tui.askQuestion("Which? ", ["A", "B", "C"]);
+  tui.feed("2\r");
+  assert((await race(p)) === "B", `question: digit keys still pick options directly`);
+  // Ctrl+C still rejects while the list is open.
+  p = tui.askQuestion("Which? ", ["A"]);
+  const rejected = p.then(() => "resolved").catch(() => "rejected");
+  tui.feed("\x03");
+  assert((await race(rejected as Promise<string>)) === "rejected", "question: Ctrl+C still rejects from the list");
+  console.log("ok: question list typing → free-text (press-any-key switch, first key seeds answer)");
 }
 
 {
@@ -6068,13 +6188,127 @@ process.exit(ok === false ? 0 : 1);`;
   g.resolveTool("g1", true);
   g.resolveTool("g2", true);
   let gb = gPlain().join("\n");
-  assert(gb.includes("×2") && gb.includes("enter to expand"), "collapsed group shows ×2 + enter-to-expand hint");
+  assert(gb.includes("× 2") && gb.includes("enter to expand"), "collapsed group shows × 2 + enter-to-expand hint");
   g.feed("\r");
   gb = gPlain().join("\n");
   assert(gb.includes("run_cmd") && gb.includes("a") && gb.includes("b"), "Enter expands the group into its tool rows");
   g.feed("\r");
   gb = gPlain().join("\n");
-  assert(gb.includes("×2"), "Enter collapses the group back to the summary row");
+  assert(gb.includes("× 2"), "Enter collapses the group back to the summary row");
+}
+
+// --- text selection copy (opencode/mimo parity: drag + Ctrl+C) -------------
+{
+  const { Tui } = await import("./tui.js");
+  const tui5 = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  Object.defineProperty(process.stdout, "rows", { value: 30, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 140, configurable: true });
+  (process.stdin as any).isTTY = true;
+  (process.stdin as any).setRawMode = () => {};
+  (process.stdin as any).resume = () => {};
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (() => true) as any;
+  tui5.start();
+  await new Promise((r) => setTimeout(r, 30));
+  tui5.push({ role: "user", text: "hello world" });
+  tui5.push({ role: "assistant", text: "Hi there, AIH!" });
+  await new Promise((r) => setTimeout(r, 30));
+  const f5 = tui5.frameForTest();
+  const hr5 = f5.findIndex((l) => l.includes("hello world"));
+  const ar5 = f5.findIndex((l) => l.includes("Hi there"));
+  const scrU = hr5 + 1;
+  const scrA = ar5 + 1;
+  // Left-button drag row=user, col2 → col11, release (single-line).
+  tui5.feed(`\x1b[<0;2;${scrU}M`);
+  tui5.feed(`\x1b[<32;11;${scrU}M`);
+  tui5.feed(`\x1b[<0;11;${scrU}m`);
+  await new Promise((r) => setTimeout(r, 30));
+  const sel5 = tui5.selectionForTest();
+  assert(sel5 !== null && sel5.r0 === scrU && sel5.c0 === 2 && sel5.c1 === 11, `drag sets selection (got ${JSON.stringify(sel5)})`);
+  assert(tui5.selectedTextForTest().includes("hello w"), `copy text extracts the visible slice (got ${JSON.stringify(tui5.selectedTextForTest())})`);
+  assert(tui5.rawFrameForTest()[hr5].includes("\x1b[7m"), "selected row renders reverse-video highlight");
+  // Ctrl+C clears the selection (no clipboard in CI → system hint).
+  tui5.feed("\x03");
+  await new Promise((r) => setTimeout(r, 30));
+  assert(tui5.selectionForTest() === null, "Ctrl+C clears the selection");
+  assert(tui5.frameForTest().some((l) => l.includes("no clipboard")), "no-clipboard fallback prints the selection");
+  // Multi-line drag + Esc clears.
+  tui5.feed(`\x1b[<0;2;${scrU}M`);
+  tui5.feed(`\x1b[<32;11;${scrU}M`);
+  tui5.feed(`\x1b[<32;6;${scrA}M`);
+  tui5.feed(`\x1b[<0;6;${scrA}m`);
+  await new Promise((r) => setTimeout(r, 30));
+  const multi = tui5.selectedTextForTest();
+  assert(multi.includes("hello") && multi.includes("Hi"), `multi-line copy joins rows (got ${JSON.stringify(multi)})`);
+  tui5.feed("\x1b");
+  await new Promise((r) => setTimeout(r, 250)); // > ESC_NOISE_MS (150)
+  assert(tui5.selectionForTest() === null, "lone Esc clears the selection");
+  tui5.stop();
+  process.stdout.write = origWrite;
+}
+
+{
+  // REGRESSION (2026-09-19, user report): "切换成选择模式后无法点击展开" —
+  // a left-button press anchors a selection, so the RELEASE of a click
+  // without drag used to keep a stale 1-cell selection and never call
+  // #clickAt. Fix: a zero-size press→release IS a click → clear the
+  // selection and toggle the tool block at that row. A real drag (release
+  // position different from the anchor) still keeps the selection for
+  // Ctrl+C copy.
+  const { Tui } = await import("./tui.js");
+  const tc = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  Object.defineProperty(process.stdout, "rows", { value: 30, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 140, configurable: true });
+  (process.stdin as any).isTTY = true;
+  (process.stdin as any).setRawMode = () => {};
+  (process.stdin as any).resume = () => {};
+  const origWrite2 = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (() => true) as any;
+  tc.start();
+  await new Promise((r) => setTimeout(r, 30));
+  tc.pushTool("run_cmd", { command: "long output" }, "c1");
+  tc.resolveTool("c1", true, "L1\nL2\nL3\nL4\nL5\nL6");
+  await new Promise((r) => setTimeout(r, 30));
+  assert(tc.frameForTest().some((l) => l.includes("more") && l.includes("expand")), "pre: tool block collapsed with expand hint");
+  // Find the tool header row in the frame (0-based) — click rows are 1-based.
+  const hdr = tc.frameForTest().findIndex((l) => l.includes("run_cmd"));
+  assert(hdr >= 0, "pre: run_cmd header row rendered");
+  // Click (press + release at the same cell) on the tool header.
+  tc.feed(`\x1b[<0;10;${hdr + 1}M`);
+  tc.feed(`\x1b[<0;10;${hdr + 1}m`);
+  await new Promise((r) => setTimeout(r, 30));
+  const fe = tc.frameForTest();
+  assert(fe.some((l) => l.includes("L5")), "click (zero-drag release) expands the tool block now");
+  assert(fe.some((l) => l.includes("enter to collapse")), "expanded state shows the collapse hint");
+  // Second click collapses again.
+  tc.feed(`\x1b[<0;10;${hdr + 1}M`);
+  tc.feed(`\x1b[<0;10;${hdr + 1}m`);
+  await new Promise((r) => setTimeout(r, 30));
+  assert(tc.frameForTest().some((l) => l.includes("more") && l.includes("expand")), "second click collapses");
+  // A real drag still creates a selection (not swallowed by the click fix).
+  tc.feed(`\x1b[<0;2;${hdr + 1}M`);
+  tc.feed(`\x1b[<32;11;${hdr + 1}M`);
+  tc.feed(`\x1b[<0;11;${hdr + 1}m`);
+  await new Promise((r) => setTimeout(r, 30));
+  assert(tc.selectionForTest() !== null && tc.selectionForTest()!.c1 === 11, "real drag still sets a selection");
+  tc.stop();
+  process.stdout.write = origWrite2;
 }
 
 // --- F#28 increment: worktree snapshot on checkpoints ------------------------

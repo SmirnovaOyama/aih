@@ -306,7 +306,7 @@ export function lastContextTokens(
     const pnum = p as number;
     const est = estimateContextTokens(events);
     // Trust a server-reported prompt count only while it stays in a sane band
-    // around the local estimate. Free-tier gateways report CUMULATIVE/garbage
+    // around the local estimate. Some gateways report CUMULATIVE/garbage
     // prompt_tokens (observed 949K / 3.2M on a ~78K-token conversation), and
     // the gateway's own window gate (2×window) wrongly green-lights those once
     // the window grows to 1M — flashing a phantom near-full "compact needed".
@@ -338,9 +338,9 @@ export function lastContextTokens(
 /**
  * Local context-size estimate (chars÷4 heuristic, pi-style) over exactly what
  * deriveMessages would send: the latest compaction summary plus every event
- * after it. Server-reported promptTokens from free-tier gateways can be
- * garbage (observed 28M on a ~500k-token conversation), so the context panel
- * derives from this instead of trusting the wire numbers.
+ * after it. Server-reported promptTokens from some gateways can be garbage
+ * (observed 28M on a ~500k-token conversation), so the context panel derives
+ * from this instead of trusting the wire numbers.
  */
 export function estimateContextTokens(events: readonly SessionEvent[]): number {
   let cutoff = -1;
@@ -377,7 +377,7 @@ export function estimateContextTokens(events: readonly SessionEvent[]): number {
 
 /**
  * Display-trust test for server-reported prompt size: positive and, when the
- * window is known, within 2× of it. Free-tier gateways have returned
+ * window is known, within 2× of it. Some gateways have returned
  * cumulative/garbage prompt_tokens that would otherwise pin the panel at
  * absurd values (and mis-trigger auto-compaction).
  */

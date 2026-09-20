@@ -50,7 +50,7 @@ export interface ProviderConfig {
   models?: Array<string | ModelEntry>;
   apiKeyEnv?: string;
   /**
-   * Mark this provider as keyless (no API key required). Use for public free
+   * Mark this provider as keyless (no API key required). Use for public
    * endpoints (HTTPS) that need no auth — otherwise buildRealLlm refuses to
    * start without a key, since only local/http endpoints and identity-header
    * providers are exempt automatically.
@@ -59,7 +59,7 @@ export interface ProviderConfig {
   /** context window (max input tokens) for this provider's model */
   contextWindow?: number;
   /**
-   * Cap for max_tokens (max output tokens) sent per request. Free tiers that
+   * Cap for max_tokens (max output tokens) sent per request. Gateways that
    * reject large max_tokens (OpenRouter 503 "can only afford N") need this.
    */
   maxTokens?: number;
@@ -162,6 +162,19 @@ export interface AihConfig {
    *        "permissions": [{ "tool": "*", "action": "deny" }] } }
    */
   agents?: Record<string, AgentProfile>;
+  /**
+   * SOCKS5 proxy for outbound webfetch/websearch (2026-09-19). When set,
+   * webfetch routes through the tunnel via undici (Node 22 has no built-in
+   * SOCKS). Later layers win; env AIH_SOCKS5_PROXY (host:port) overrides.
+   * e.g. { "proxy": { "socks5": "127.0.0.1:1080" } }
+   * (optional username/password for auth-required proxies)
+   */
+  proxy?: {
+    socks5?: string;
+    username?: string;
+    password?: string;
+    timeoutMs?: number;
+  };
   /**
    * PE#1/PE#2 — safety seam (harness enforces, not the model):
    *   - `budget`: hard constraints + tripwire —
@@ -437,6 +450,24 @@ export function loadAutoAllowReadonly(): boolean {
     if (typeof config.autoAllowReadonly === "boolean") out = config.autoAllowReadonly;
   }
   return out;
+}
+
+/**
+ * SOCKS5 proxy for webfetch/websearch. Merged across config layers (later
+ * wins); env AIH_SOCKS5_PROXY (host:port) overrides the endpoint. Returns
+ * undefined when no proxy is configured (webfetch falls back to direct).
+ */
+export function loadProxy():
+  | { socks5?: string; username?: string; password?: string; timeoutMs?: number }
+  | undefined {
+  let out: { socks5?: string; username?: string; password?: string; timeoutMs?: number } | undefined;
+  for (const { config } of loadLayers()) {
+    if (config.proxy) out = { ...out, ...config.proxy };
+  }
+  const envProxy = process.env.AIH_SOCKS5_PROXY;
+  if (envProxy) out = { ...out, socks5: envProxy };
+  if (out && out.socks5) return out;
+  return undefined;
 }
 
 /**

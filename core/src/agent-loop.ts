@@ -1,5 +1,6 @@
 import type { LLMAdapter } from "./seams/llm.js";
 import { CONTEXT_LENGTH_RE, NetworkFinishError, QuotaError, StallError, NETWORK_FAILURE_RE, NETWORK_UNREACHABLE_RE, errFullText } from "./seams/llm-sse.js";
+import { opencodeIDBody } from "./seams/llm-openai.js";
 import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT, STREAM_RESUME_PROMPT, TRUNCATED_RETRY_PROMPT } from "./prompts.js";
 import type { LoopObserver } from "./observers.js";
 import { LoopAbort, notifyObservers } from "./observers.js";
@@ -315,6 +316,10 @@ const RESERVED_RATIO = 0.2;         // fraction of the window reserved for outpu
 /** Summary output bound (opencode SUMMARY_OUTPUT_TOKENS parity). Prevents the
  *  summary LLM from emitting unbounded output; aih also slices to 12K chars as
  *  a belt-and-braces guard, but the token bound stops the generation early. */
+/** Fallback model for compaction summaries (AIH_SUMMARY_MODEL overrides). */
+function summaryModelOverride(_env?: string): string {
+  return process.env.AIH_SUMMARY_MODEL?.trim() || "big-pickle";
+}
 const SUMMARY_OUTPUT_TOKENS = 4_096;
 
 const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
@@ -378,6 +383,20 @@ export class AgentLoop {
   /** P#36④ — re-primed the interrupted turn once after an overflow recovery. */
   #overflowReprimed = false;
   #onPromptInput?: (messages: ChatMessage[]) => void;
+  /**
+   * CC#51 — the caller's quota-wait hook (from send()). Saved at the loop
+   * level so the COMPACTION summary path (`#completeSummary`) shares the SAME
+   * quota-recovery as the main loop instead of failing a compact on a
+   * FreeUsageLimitError that a waiting main loop would have survived. This is
+   * the "same LLM, same recovery" unification: a quota 429 anywhere — main
+   * turn or compaction summary — waits for the reset and re-issues the call.
+   */
+  /** Zen contributor-gate fallback: model override for summary calls only. */
+  #summaryModelOverride?: string;
+  #quotaWait?: {
+    begin: (info: { retryAfterSec: number; resumeAtMs: number; wait: number }) => void;
+    end: (reason: string) => void;
+  };
   /** FA#5 — pluggable loop observers (each implements only the callbacks it needs). */
   #observers: readonly LoopObserver[];
   /** PE#2 — budget tracker (hard constraint + tripwire). */
@@ -629,6 +648,9 @@ export class AgentLoop {
     },
   ): Promise<TurnResult> {
     const turnId = `turn_${Date.now().toString(36)}`;
+    // CC#51 — share the caller's quota-wait hook with the compaction summary
+    // path (unification: same LLM, same quota recovery).
+    this.#quotaWait = hooks?.quotaWait;
     const ac = new AbortController();
     this.#activeAbort = ac;
     this.#log.append({ type: "turn/start", turnId });
@@ -711,10 +733,17 @@ export class AgentLoop {
       const doComplete = () => {
         const input = buildInput();
         this.#onPromptInput?.(input);
+        // STREAM parity (owner-level): the main loop streams every request —
+        // including subagent/title side-calls. send() previously only streamed
+        // when a caller passed hooks.onDelta; subagents (task/best_of_n/goal/
+        // workflow/serve) call send() with NO hooks → non-streaming. Always emit
+        // stream:true (no-op onDelta when the caller has none); the adapter
+        // accumulates the SSE text and returns the same LLMResponse, so callers
+        // are unaffected. Fixes all subagent paths in one place.
         return this.#llm.complete({
           messages: input,
           tools: this.#tools.schemas(),
-          ...(hooks?.onDelta ? { onDelta: hooks.onDelta } : {}),
+          onDelta: hooks?.onDelta ?? (() => {}),
           ...(hooks?.onRetry ? { onRetry: hooks.onRetry } : {}),
           signal: ac.signal,
         });
@@ -820,7 +849,7 @@ export class AgentLoop {
           // it so unreachable endpoints (ECONNREFUSED/ENOTFOUND) are told apart
           // from transient mid-flight failures (which may warrant a park).
           const fullMsg = errFullText(err);
-          // Provider text is unreliable about WHY it failed: free-tier gateways
+          // Provider text is unreliable about WHY it failed: some gateways
           // return generic "HTTP 500 Internal server error" when the real cause
           // is an oversized prompt. When the local estimate says we're near the
           // window, treat opaque server errors as suspected overflow and try
@@ -911,25 +940,25 @@ export class AgentLoop {
       usage = addUsage(usage, response.usage);
       if (typeof response.genMs === "number") genMs += response.genMs;
       const promptTokens = response.usage?.promptTokens ?? 0;
-      // Free-tier gateways sometimes report cumulative/garbage prompt_tokens
-      // (observed 28M on a ~500k-token conversation). Trust the wire number
-      // only when it is plausibly bounded by the window AND stays within a
-      // sane band of the local chars÷4 estimate; otherwise keep the local
-      // estimate so compaction triggers and any UI stay sane. The window check
-      // alone is NOT enough: a gateway's cumulative 949K read slips through a
-      // 2×window gate once the window grows to 1M, then falsely trips the
-      // 80% compaction trigger (949K ≥ 0.8×1M).
+      // Some gateways report cumulative/garbage prompt_tokens (observed 28M on
+      // a ~500k-token conversation). Trust the wire number only when it is
+      // plausibly bounded by the window AND stays within a sane band of the
+      // local chars÷4 estimate; otherwise keep the local estimate so compaction
+      // triggers and any UI stay sane. The window check alone is NOT enough: a
+      // gateway's cumulative 949K read slips through a 2×window gate once the
+      // window grows to 1M, then falsely trips the 80% compaction trigger
+      // (949K ≥ 0.8×1M).
       //
       // Bidirectional band (same as cli/src/cost.ts lastContextTokens): reject
       // the wire number when it is ≫ the local estimate (cumulative/garbage
       // read) OR ≪ it (a stale/shrunk sample). The lower bound is the
-      // regression fix: a free-tier gateway (opencode zen) reported ~150K
-      // promptTokens on a conversation whose true size was ~213K — the old
-      // one-sided band admitted 150K (≤ est×3), so effectiveContext sat below
-      // the 160K trigger while the panel kept showing the real 213K, and
-      // compaction never fired mid-turn until the local estimate grew much
-      // larger. Using est as the floor (when plausible fails) keeps the
-      // compaction trigger honest with what deriveMessages would actually send.
+      // regression fix: a gateway reported ~150K promptTokens on a
+      // conversation whose true size was ~213K — the old one-sided band
+      // admitted 150K (≤ est×3), so effectiveContext sat below the 160K
+      // trigger while the panel kept showing the real 213K, and compaction
+      // never fired mid-turn until the local estimate grew much larger. Using
+      // est as the floor (when plausible fails) keeps the compaction trigger
+      // honest with what deriveMessages would actually send.
       const est = this.#estimateContext();
       const plausible =
         promptTokens > 0 &&
@@ -1085,6 +1114,12 @@ export class AgentLoop {
               turnId,
               inject: (ctxText) => this.inject(ctxText),
               source: this.#inputSource,
+              // Cancel propagation (2026-09-19 user report: Esc/Ctrl+C during a
+              // LONG-RUNNING tool never ended the turn — the loop's abort flag
+              // is only checked BETWEEN steps, so a 60s tool turned "cancel"
+              // into a full natural finish). Pass the turn's abort signal so
+              // the registry can race the tool against the cancel.
+              signal: ac.signal,
             });
           // MK#44 (T1): dispatch facts land BEFORE the tool/call event (the
           // assistant's call is appended with its outcome below) but BEFORE
@@ -1580,19 +1615,89 @@ export class AgentLoop {
    */
   async #completeSummary(messages: ChatMessage[]): Promise<{ text: string; usage?: TokenUsage }> {
     let maxTokens = SUMMARY_OUTPUT_TOKENS;
+    // Some gateways 403 a summary request REGARDLESS of identity headers when
+    // the active model is gated. The MAIN turn passes because the user's
+    // active model is pool-ok — but compaction shares this.#llm, so when the
+    // ACTIVE model is gated, every compact dies with 403. Fallback: on
+    // FreeTierError, retry the summary with a pool-friendly override
+    // (per-request `model`, adapter-level; the main loop's model is never
+    // touched). AIH_SUMMARY_MODEL env overrides the fallback choice.
+    const summaryModel = process.env.AIH_SUMMARY_MODEL?.trim() || "big-pickle";
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const response = await this.#llm.complete({
-        messages,
-        tools: [],
-        maxTokens,
-        ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
-      });
+      let response: LLMResponse;
+      try {
+        // Tool-array parity: the summary previously sent tools with only the
+        // config extraTools stubs (bash/read) while MAIN turns carry the full
+        // registry schemas (run_cmd/...) — a DIFFERENT tools fingerprint from
+        // the same client. Some gateways fingerprint the client by its tool
+        // declarations, and the divergence trips "can only be used from within
+        // opencode". Send the SAME schemas as the main loop so the compact
+        // request's wire shape matches a main turn 1:1. (The model never
+        // calls them mid-summary; tool_choice stays "auto".)
+        // STREAM parity: the gateway sends stream:true + stream_options on
+        // EVERY request — including its own tools-less side-calls (title
+        // generation). A NON-streaming request is treated as a non-opencode
+        // client and returns FreeTierError ("can only be used from within
+        // opencode") on strict IPs. A no-op onDelta makes the adapter emit
+        // stream:true with identical stream_options; the SSE text is
+        // accumulated and returned exactly as before (no behavior change for
+        // callers).
+        response = await this.#llm.complete({
+          messages,
+          tools: this.#tools.schemas(),
+          maxTokens,
+          onDelta: () => {},
+          ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
+          ...(this.#summaryModelOverride ? { model: this.#summaryModelOverride } : {}),
+        });
+      } catch (err) {
+        // CC#51 unification — the compaction summary uses the SAME LLM as the
+        // main loop, so a quota 429 must get the SAME recovery: wait for the
+        // reset and re-issue (bounded), exactly like send()'s quota branch.
+        // Before this, a FreeUsageLimitError during compaction failed the
+        // compact silently (#compactOrSkip catch) and the context never
+        // shrank — the user saw usage climb past the window with no
+        // compaction happening. Non-interactive runs (no hook) still fail
+        // fast and predictably.
+        // Contributor gate: FreeTierError on the summary is a MODEL policy
+        // (not headers/IP) — retry once with the fallback model instead of
+        // failing the whole compaction ($activeUserModel keeps running main
+        // turns; only the summary lane switches).
+        if (
+          !this.#summaryModelOverride &&
+          /FreeTierError/i.test(errFullText(err)) &&
+          this.#llmSupportsModelOverride()
+        ) {
+          this.#summaryModelOverride = summaryModelOverride();
+          process.stderr.write(
+            `[aih] active model is gated for summaries — retrying compaction with ${this.#summaryModelOverride} (set AIH_SUMMARY_MODEL to change)\n`,
+          );
+          if (attempt < 2) continue;
+        }
+        const qw = this.#quotaWait;
+        if (!qw || !(err instanceof QuotaError) || err.terminal) throw err;
+        const waitSec = Math.min(
+          Math.max(1, Math.round(err.retryAfterSec || QUOTA_DEFAULT_WAIT_SEC)),
+          QUOTA_MAX_WAIT_SEC,
+        );
+        const resumeAtMs = Date.now() + waitSec * 1000;
+        qw.begin({ retryAfterSec: waitSec, resumeAtMs, wait: 1 });
+        await sleepMs(waitSec * 1000);
+        qw.end("done");
+        continue; // re-issue the same summary request (attempt count unchanged)
+      }
       if (response.finishReason !== "length" || attempt === 2) {
         return { text: response.text, usage: response.usage };
       }
       maxTokens *= 2;
     }
     /* unreachable */ return { text: "" };
+  }
+
+  /** Detect (per-request, duck type) whether the configured adapter honors
+   * `req.model` overrides — mock adapters ignore it harmlessly. */
+  #llmSupportsModelOverride(): boolean {
+    return typeof (this.#llm as { complete?: unknown }).complete === "function";
   }
 
   #compactOrSkip(
@@ -1609,6 +1714,7 @@ export class AgentLoop {
       process.stderr.write(
         `[aih] auto-compaction failed (turn=${turnId}, trigger=auto, continuing without it): ${msg}\n`,
       );
+      notifyObservers(this.#observers, (o) => o.onCompactionFailed?.(turnId, "auto", msg));
       return { usage: undefined, applied: false };
     });
   }
@@ -1636,7 +1742,26 @@ export class AgentLoop {
     // session identity ("{sid}" header → fresh id), keeping gateway-side
     // per-session state and the main conversation's prompt-cache lineage
     // free of summary traffic. The mock adapter ignores the field.
-    this.#summarySid ??= `aih-compact-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    // Same id CONSTRUCTION as the main agent's sid (opencodeIDBody: 12 hex ts
+    // + 14 base62) so the gateway sees a conforming session identity — but a
+    // DISTINCT id, keeping P#36⑤ isolation (summary traffic off the main
+    // conversation's prompt-cache lineage).
+    // Fresh-session admission gate: the side-channel summary sid gets its OWN
+    // first-contact with the gateway; on some networks a fresh ses id admission
+    // is rejected (403) while the main conversation's ALREADY-ESTABLISHED
+    // session passes. Default keeps P#36⑤ isolation; AIH_SUMMARY_REUSE_SID=1
+    // reuses the MAIN session id so compaction rides the established session's
+    // admission.
+    const reuseSid = /^(1|true|yes)$/i.test(process.env.AIH_SUMMARY_REUSE_SID ?? "");
+    // Disable the side-channel entirely when reusing: completeSummary then
+    // sends the summary WITHOUT the per-request sessionId, so the adapter's
+    // "{sid}" resolves to the MAIN session id (the established gateway
+    // session) — exactly what the A/B test needs.
+    if (reuseSid) {
+      this.#summarySid = undefined as unknown as string;
+    } else {
+      this.#summarySid ??= opencodeIDBody();
+    }
     // Fold authoritative current state (e.g. todo list) into the summary so a
     // compacted agent never forgets what is already done vs still pending.
     const contextSnapshot = this.#compactContext?.()?.trim();
@@ -1660,8 +1785,12 @@ export class AgentLoop {
       // the next LLM call may 400 (context overflow) or hang. One stderr
       // line keeps the failure diagnosable without a debug flag (same
       // principle as #compactOrSkip's catch).
+      const reason = "empty summary";
       process.stderr.write(
         `[aih] compaction produced empty summary (turn=${turnId}, head=${head.length} msgs) — context NOT reduced\n`,
+      );
+      notifyObservers(this.#observers, (o) =>
+        o.onCompactionFailed?.(turnId, opts?.trigger ?? "auto", reason),
       );
       return { usage, applied: false };
     }

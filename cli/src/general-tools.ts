@@ -8,6 +8,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { publishFile } from "./atomic.js";
+import { loadProxy } from "./config.js";
+import { socksFetch } from "./socks-proxy.js";
 import { dirname, join, relative, resolve } from "node:path";
 import type { ApprovalGate, LLMAdapter, ToolHooks, ToolRegistry } from "@aih/core";
 import { AgentLoop, SessionLog, ToolRegistry as Registry } from "@aih/core";
@@ -851,10 +853,34 @@ export function registerGeneralTools(
       if (!/^https?:\/\//.test(url)) throw new Error("url must be absolute http(s)");
       const timeoutMs = resolveFetchTimeout(a.timeout, process.env.AIH_FETCH_TIMEOUT_MS);
       let res: Response;
-      try {
-        res = await fetchWithRetry(url, { timeoutMs });
-      } catch (e) {
-        throw e instanceof Error ? e : new Error(fetchFailureMessage(e, url, timeoutMs));
+      const proxy = loadProxy();
+      if (proxy?.socks5) {
+        // SOCKS5 tunnel (config `proxy` / AIH_SOCKS5_PROXY): undici fetch
+        // through the tunnel; keep the same hardening headers + timeout.
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          res = (await socksFetch(url, {
+            signal: controller.signal,
+            redirect: "follow",
+            headers: {
+              "user-agent": FETCH_UA_BROWSER,
+              accept: FETCH_ACCEPT_TEXT,
+              "accept-language": "en-US,en;q=0.9",
+            },
+          }, proxy)) as unknown as Response;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          throw new Error(`webfetch via socks5 proxy ${proxy.socks5} failed: ${msg}. Check the proxy is running and reachable; unset proxy.socks5 to fall back to direct.`);
+        } finally {
+          clearTimeout(timer);
+        }
+      } else {
+        try {
+          res = await fetchWithRetry(url, { timeoutMs });
+        } catch (e) {
+          throw e instanceof Error ? e : new Error(fetchFailureMessage(e, url, timeoutMs));
+        }
       }
       if (!res.ok) {
         const cf = isCloudflareChallenge(res) ? " (Cloudflare bot challenge — the site is blocking non-browser clients)" : "";
@@ -912,17 +938,31 @@ export function registerGeneralTools(
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 25_000);
       let res: Response;
+      const proxy = loadProxy();
       try {
-        res = await fetch("https://search.parallel.ai/mcp", {
-          method: "POST",
-          signal: controller.signal,
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json, text/event-stream",
-            "User-Agent": "aih/0.2",
-          },
-          body,
-        });
+        if (proxy?.socks5) {
+          res = (await socksFetch("https://search.parallel.ai/mcp", {
+            method: "POST",
+            signal: controller.signal,
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json, text/event-stream",
+              "User-Agent": "aih/0.2",
+            },
+            body,
+          }, proxy)) as unknown as Response;
+        } else {
+          res = await fetch("https://search.parallel.ai/mcp", {
+            method: "POST",
+            signal: controller.signal,
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json, text/event-stream",
+              "User-Agent": "aih/0.2",
+            },
+            body,
+          });
+        }
       } finally {
         clearTimeout(timer);
       }

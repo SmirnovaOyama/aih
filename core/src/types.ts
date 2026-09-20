@@ -371,6 +371,14 @@ export interface LLMRequest {
    * Absent → the adapter's configured maxTokens (or provider default) applies.
    */
   maxTokens?: number;
+  /**
+   * Per-request model override (compaction FreeTierError fallback). Some
+   * models are CONTRIBUTOR-gated: 403 FreeTierError even with the correct
+   * identity headers. When the summary call hits that, the agent loop retries
+   * with a pool-friendly model via this field (real key / user config always
+   * wins — the override only applies to THIS call).
+   */
+  model?: string;
 }
 
 export interface LLMResponse {

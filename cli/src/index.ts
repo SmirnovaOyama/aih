@@ -242,7 +242,7 @@ import {
   type Trace,
 } from "./measure.js";
 
-export const VERSION = "0.8.13";
+export const VERSION = "0.8.14";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );
@@ -672,6 +672,26 @@ function buildRealLlm(flags: Record<string, string | boolean>, sessionId?: strin
     envModel: process.env.AIH_MODEL,
     envBaseUrl: process.env.AIH_BASE_URL,
   });
+  // Fresh install (packaged config ships no providers/models): instead of a
+  // cryptic "no API key" / "no model id" error, guide the user to configure a
+  // provider first. Only triggers when NOTHING is configured at any layer
+  // (no provider, no model, no base-url) — an explicit --model/--base-url/--api-key
+  // or env override still takes the normal path below.
+  if (
+    !resolved.provider &&
+    !resolved.model.value &&
+    !resolved.baseUrl.value &&
+    !str(flags, "api-key") &&
+    !process.env.AIH_API_KEY
+  ) {
+    throw new Error(
+      "no provider configured yet — pick one and set it up, then retry:\n" +
+        "  aih connect            # browse the provider catalog\n" +
+        "  aih connect <id> --key <API_KEY>   # save a provider + key\n" +
+        "or add one to aih.json: { \"providers\": { \"<name>\": { \"baseUrl\": \"...\", \"model\": \"...\" } } }\n" +
+        "(no key needed for self-hosted / keyless endpoints; --mock runs an offline demo)",
+    );
+  }
   // CL-R#7 — sanitize credential at the storage boundary (strip control chars,
   // zero-width spaces, BOM, leading/trailing whitespace). Pure whitespace → ""
   // (treated as "not configured").
@@ -681,9 +701,9 @@ function buildRealLlm(flags: Record<string, string | boolean>, sessionId?: strin
     process.env.AIH_API_KEY,
   );
   // Keyless is legitimate for: (a) providers carrying identity headers (opencode
-  // Zen free tier authenticates by client fingerprint) — but ONLY when the
-  // request actually goes to that provider's own endpoint, and (b) self-hosted
-  // endpoints (llama.cpp/Ollama/vLLM) that run without auth. An env/flag URL
+  // authenticates by client fingerprint) — but ONLY when the request actually
+  // goes to that provider's own endpoint, and (b) self-hosted endpoints
+  // (llama.cpp/Ollama/vLLM) that run without auth. An env/flag URL
   // override that moves the request OFF the provider's home invalidates (a):
   // opencode's fingerprint headers sent to api.openai.com authenticate nothing.
   const providerHome = resolved.provider
@@ -715,10 +735,10 @@ function buildRealLlm(flags: Record<string, string | boolean>, sessionId?: strin
   const owner = resolved.provider;
   // OpenCode Go REJECTS requests that lack `x-opencode-session` (HTTP 400
   // "MissingSessionID — request is missing x-opencode-session and cannot be
-  // routed efficiently"), and Zen free tier uses the header for routing and
-  // prompt-cache affinity. Inject it for every opencode.ai endpoint, even when
-  // the saved provider config predates the header (catalog entries now carry
-  // it explicitly; "{sid}" resolves to the conversation-stable session id).
+  // routed efficiently"), and the opencode.ai pool uses the header for routing
+  // and prompt-cache affinity. Inject it for every opencode.ai endpoint, even
+  // when the saved provider config predates the header (catalog entries now
+  // carry it explicitly; "{sid}" resolves to the conversation-stable session id).
   const opencodeEndpoint = isOpencodeEndpoint(resolved.baseUrl.value ?? "");
   const headers: Record<string, string> = { ...resolved.headers };
   if (
@@ -2216,7 +2236,25 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
       compactContext: () => compactStateContext(log, process.cwd()),
-      observers: [createDoomLoopEscalationObserver(), repObs],
+      observers: [
+        createDoomLoopEscalationObserver(),
+        repObs,
+        {
+          // Surface a failed compaction in the TUI instead of only stderr: a
+          // bloated-but-never-compacting session (summary LLM quota 403 /
+          // empty summary) used to be invisible — the usage panel climbed
+          // past the window with no hint why. Now the user sees the reason
+          // and can retry /compact after the quota resets.
+          onCompactionFailed: (_turnId, trigger, reason) => {
+            const label = trigger === "manual" ? "manual compaction" : "auto-compaction";
+            if (tuiRef.current) {
+              tuiRef.current.pushSystem(`⚠ ${label} failed — context NOT reduced (${reason}). Try /compact after the quota resets.`);
+            } else {
+              process.stderr.write(`[aih] ${label} failed: ${reason}\n`);
+            }
+          },
+        },
+      ],
       ...(tuiSafety
         ? {
             budget: tuiSafety.budget,
@@ -5339,6 +5377,15 @@ async function cmdConfig(flags: Record<string, string | boolean>) {
           ...llm.contextWindow,
           value: llm.contextWindow.value !== undefined ? Number(llm.contextWindow.value) : undefined,
           effective: resolveContextWindow(flags),
+        },
+        // Real-machine diagnosis (2026-09-19 compact-403): show the RESOLVED
+        // identity headers the runtime will send, plus the provider's raw
+        // headers/keyless — a stale config.json (never overwritten by the
+        // installer) is the top suspect for "normal OK / compact 403".
+        providerDiagnostics: {
+          headers: Object.keys(llm.headers ?? {}),
+          keyless: llm.keyless === true,
+          extraTools: (llm.extraTools ?? []).map((t) => t?.function?.name).filter(Boolean),
         },
         servers: servers.servers,
         serverSource: servers.label,

@@ -7,6 +7,22 @@ description: AIH release notes — key changes in 0.8.x / 0.7.x / 0.6.x / 0.5.x.
 
 The full itemized record lives in the repo [`CHANGELOG.md`](https://github.com/summit4you/aih/blob/main/CHANGELOG.md) (Keep a Changelog format, SemVer). This page is a per-version summary.
 
+## 0.8.14 (2026-09-20)
+
+**Added**
+
+- **SOCKS5 proxy for `webfetch` / `websearch`** — outbound web tools can now route through a SOCKS5 tunnel. Add `{"proxy": {"socks5": "127.0.0.1:1080"}}` to `aih.json` (optional `username`/`password`/`timeoutMs`), or override with `AIH_SOCKS5_PROXY=host:port`. Built on undici's official `Socks5ProxyAgent` (pure JS, no native deps) so it handles the CONNECT handshake, optional auth, and the TLS wrap for HTTPS targets — and bundles cleanly into the offline package. With no proxy configured the direct path is used exactly as before.
+
+**Changed**
+
+- **Auxiliary LLM calls now stream at the adapter level** — side-calls that bypass the main loop's streaming (goal judge, `best_of_n`, MEA guardian/auditor, dream/title/branch distillation, compaction summary) previously emitted `stream:false` and were rejected (403) by gateways that only accept streaming from a keyless client. The adapter now owns the stream decision in one place so every such call is covered; the final text is still fully assembled and callers see no behavior change.
+- **Clean-slate offline packaging** — the packaged default config now ships **no providers, no models and no proxy**, a clean slate so each user configures their own endpoint after install (`aih connect` / `aih config` / `aih.json`). The build machine's local `aih.json` (providers, models, proxy, local endpoints) is stripped, not merged, so nothing machine-local leaks into the installer.
+- **Fresh-install startup guidance** — with nothing configured, `aih run` / `aih chat` no longer fail with a cryptic "no API key" / "no model id" error; the user is pointed at `aih connect` (catalog) or adding a provider to `aih.json`. Self-hosted / keyless endpoints need no key; `--mock` runs an offline demo.
+
+**Docs**
+
+- **0.8.13 release page width** — the content column was capped at 840px and left-aligned inside a ~1200px content area, leaving a large empty band on the right. The reading column is now wider and centered so the page uses its width properly on desktop while staying responsive on mobile.
+
 ## 0.8.13 (2026-09-18)
 
 **Fixed**

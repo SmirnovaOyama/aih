@@ -962,7 +962,7 @@ with any MCP app tools; same-name → app tool wins):
 | `remember` | project memory: append/rewrite `.aih/memory.md`, cross-session persistent knowledge | allow |
 | `memory_recall` | retrieve project+user memory: free-text query → token-overlap scoring returns the most relevant entries (zero deps; fallback recall when the injected block is budget-truncated) | allow |
 | `question` | the model asks the user a question and waits (TUI inline Q&A line) | allow |
-| `webfetch` | fetch URL → plain text (HTML→text, 64KB cap). Browser-grade UA + Accept headers, one bounded network retry, Cloudflare 403 challenge auto-retries with an honest UA, `timeout` param (seconds, default 30, cap 120), content-length precheck before download, actionable failure messages (suggests alternate endpoint/websearch) | allow |
+| `webfetch` | fetch URL → plain text (HTML→text, 64KB cap). Browser-grade UA + Accept headers, one bounded network retry, Cloudflare 403 challenge auto-retries with an honest UA, `timeout` param (seconds, default 30, cap 120), content-length precheck before download, actionable failure messages (suggests alternate endpoint/websearch). Optional SOCKS5 proxy (config `proxy.socks5` / `AIH_SOCKS5_PROXY`) — routes HTTP **and** HTTPS through the tunnel | allow |
 | `websearch` | DuckDuckGo search (titles/URLs/snippets, key-free) | allow |
 | `task` | dispatch subagent (independent context, ≤8 steps, no further nesting) | allow* |
 | `apply_patch` | multi-file patch (Add/Update/Delete/Move, opencode format) | ask |
@@ -1215,6 +1215,7 @@ same-named tools are renamed `<server>_<tool>` to disambiguate:
 | `AIH_TOOL_CONCURRENCY` (4) | concurrency cap for consecutive read-only tool calls in one step (writes stay serial) |
 | `AIH_FORMAT_TIMEOUT_MS` (15000) | post-write auto-format timeout (failure never blocks the write) |
 | `AIH_FETCH_TIMEOUT_MS` (30000) | webfetch default timeout (tool `timeout` param wins; hard cap 120000) |
+| `AIH_SOCKS5_PROXY` (host:port) | SOCKS5 proxy for webfetch/websearch (overrides config `proxy.socks5`); HTTP **and** HTTPS route through the tunnel (undici `Socks5ProxyAgent`) |
 | `AIH_MOCK_AUX_TEXT` | mock-mode reply text for tool-less auxiliary calls (goal judge / branch distillation; test hook) |
 | `AIH_SECOND_JUDGE_MODEL` | model id for the `best_of_n` second judge (FB#2 dual-judge panel; reuses the primary provider's base-url/api-key; default → single judge) |
 | `AIH_BUDGET` | PE#2 hard budget constraint: JSON or `maxCostUsd=1\|maxWrites=5\|timeoutMs=60000\|denyPaths=a\|b` (overrun → escalate, exit code 3) |

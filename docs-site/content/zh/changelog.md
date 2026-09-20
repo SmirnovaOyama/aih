@@ -7,6 +7,22 @@ description: AIH 版本更新日志 —— 0.8.x / 0.7.x / 0.6.x / 0.5.x 的主�
 
 完整逐条记录见仓库 [`CHANGELOG.md`](https://github.com/summit4you/aih/blob/main/CHANGELOG.md)（Keep a Changelog 格式，SemVer 版本）。本页为各版本要点摘要。
 
+## 0.8.14（2026-09-20）
+
+**新增**
+
+- **`webfetch` / `websearch` 支持 SOCKS5 代理** — 出站网络工具可经 SOCKS5 隧道转发；`aih.json` 加 `{"proxy": {"socks5": "127.0.0.1:1080"}}`（可选 `username`/`password`/`timeoutMs`），或 `AIH_SOCKS5_PROXY=host:port` 覆盖。基于 undici 官方 `Socks5ProxyAgent`（纯 JS、无原生依赖），处理 CONNECT 握手、可选鉴权与 HTTPS 的 TLS 包裹，离线包也能正常携带；未配置时走直连，行为不变。
+
+**变更**
+
+- **辅助 LLM 调用统一在适配层走流式** — goal judge、`best_of_n`、MEA guardian/auditor、dream/title/branch 蒸馏、压缩摘要等绕过主循环流式的旁路调用，此前发 `stream:false` 被只接受流式的网关拒绝（403）；现由适配层统一决定流式，每条旁路都覆盖，最终文本仍完整拼装，调用方无感知。
+- **离线包默认配置改为"净版"** — 打包默认配置不再携带任何 provider / 模型 / 代理，安装后由用户自行配置端点（`aih connect` / `aih config` / `aih.json`）；构建机本地的 `aih.json`（provider、模型、代理、内网端点）被剥离而非合并，杜绝机器本地信息泄漏进安装包。
+- **全新安装启动引导** — 未配置任何 provider 时，`aih run` / `aih chat` 不再报晦涩的"no API key"/"no model id"，而是引导用户 `aih connect`（浏览目录）或在 `aih.json` 加 provider；自托管 / 免 key 端点无需密钥，`--mock` 可离线演示。
+
+**文档**
+
+- **0.8.13 发布页宽度修复** — 内容列此前被限宽 840px 且左对齐，在约 1200px 的内容区里右侧留一大片空白；现加宽阅读列并居中，桌面端正常利用宽度，移动端仍响应式。
+
 ## 0.8.13（2026-09-18）
 
 **修复**

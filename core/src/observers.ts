@@ -52,6 +52,15 @@ export interface LoopObserver {
   onToolResult?(turnId: string, result: ObserverToolResult): void;
   /** The loop compacted the context (after the compaction event). */
   onCompaction?(turnId: string, summaryChars: number): void;
+  /**
+   * An auto/manual compaction attempt FAILED (summary LLM error, empty
+   * summary, or any abort) and the context was NOT reduced. Mirrors the
+   * stderr line `#compactOrSkip` already writes, surfaced to the host (TUI
+   * pushSystem) so a bloated-but-never-compacting session is diagnosable.
+   * `trigger` is "auto" | "manual"; `reason` is the error text or
+   * "empty summary".
+   */
+  onCompactionFailed?(turnId: string, trigger: "auto" | "manual", reason: string): void;
 }
 
 /**

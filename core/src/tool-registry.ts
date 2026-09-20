@@ -229,16 +229,49 @@ export class ToolRegistry {
     this.#callHistory.push(hash);
     if (this.#callHistory.length > 100) this.#callHistory.shift();
 
+    // Cancel propagation (2026-09-19 user report: Esc/Ctrl+C while a
+    // long-running tool executes never ended the turn — the agent loop only
+    // checks its abort flag BETWEEN steps). Race the tool against the turn's
+    // abort signal: when cancel fires mid-tool, resolve immediately with a
+    // "cancelled" outcome. The tool's own execute() promise is left to settle
+    // in the background (its result is discarded; child processes still
+    // respect their own timeouts) — its rejection is swallowed.
     let outcome: ToolInvocationResult;
-    try {
-      const result = await def.execute(args, ctx);
-      outcome = { ok: true, result, permission: "granted" };
-    } catch (err) {
-      outcome = {
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-        permission: "granted",
-      };
+    if (ctx.signal) {
+      if (ctx.signal.aborted) {
+        outcome = { ok: false, error: "cancelled by user", permission: "granted" };
+      } else {
+        outcome = await new Promise<ToolInvocationResult>((resolve) => {
+          const onAbort = () =>
+            resolve({ ok: false, error: "cancelled by user", permission: "granted" });
+          ctx.signal!.addEventListener("abort", onAbort, { once: true });
+          void def
+            .execute(args, ctx)
+            .then((result) => {
+              ctx.signal?.removeEventListener("abort", onAbort);
+              resolve({ ok: true, result, permission: "granted" });
+            })
+            .catch((err) => {
+              ctx.signal?.removeEventListener("abort", onAbort);
+              resolve({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+                permission: "granted",
+              });
+            });
+        });
+      }
+    } else {
+      try {
+        const result = await def.execute(args, ctx);
+        outcome = { ok: true, result, permission: "granted" };
+      } catch (err) {
+        outcome = {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+          permission: "granted",
+        };
+      }
     }
 
     for (const after of this.#hookAfter) {

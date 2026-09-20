@@ -734,6 +734,40 @@ assert(retryRes.genMs === undefined, "non-streaming response carries no genMs (F
   );
 }
 
+// Zenfree sentinel regression (2026-09-19): a KEYLESS client hitting
+// *.opencode.ai must send `Authorization: Bearer public` (the identity
+// sentinel captured from the real opencode 1.18.31 client via mitmproxy).
+// Absent the header the gateway 403s with FreeTierError. Real keys win;
+// non-opencode.ai endpoints stay headerless; remote non-opencode hosts never
+// get the sentinel (no credential spill to lookalike hosts).
+{
+  const seen: (string | undefined)[] = [];
+  const ok200 = () =>
+    new Response(
+      JSON.stringify({ choices: [{ message: { content: "ok" } }], usage: {} }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  const mk = (baseUrl: string, apiKey?: string) =>
+    new OpenAICompatibleLLM({
+      baseUrl,
+      model: "m",
+      retries: 0,
+      ...(apiKey ? { apiKey } : {}),
+      fetchImpl: (async (_url: string | URL, init?: RequestInit) => {
+        seen.push(new Headers(init?.headers).get("authorization") ?? undefined);
+        return ok200();
+      }) as typeof fetch,
+    });
+  await mk("https://opencode.ai/zen/v1").complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
+  assert(seen[0] === "Bearer public", `keyless + opencode.ai → Bearer public sentinel (got ${JSON.stringify(seen[0])})`);
+  await mk("https://opencode.ai/zen/v1", "sk-real").complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
+  assert(seen[1] === "Bearer sk-real", `real key wins over the sentinel (got ${JSON.stringify(seen[1])})`);
+  await mk("https://api.openai.com/v1").complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
+  assert(seen[2] === undefined, `non-opencode.ai endpoint stays headerless (got ${JSON.stringify(seen[2])})`);
+  await mk("https://evil-opencode.ai/v1").complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
+  assert(seen[3] === undefined, `lookalike host does NOT get the sentinel (got ${JSON.stringify(seen[3])})`);
+}
+
 // Transient-failure resilience (opencode-parity): exponential backoff bounds
 // and generous default budget.
 assert(DEFAULT_RETRIES >= 5, "default retry budget spans multi-second provider bursts");
@@ -1775,8 +1809,10 @@ assert(
   await isoLoop.compactNow();
   assert(
     seenSessionIds.length >= 1 &&
-      seenSessionIds.every((s) => typeof s === "string" && s.startsWith("aih-compact-")),
-    `every summary call carries its own side-channel sessionId (${seenSessionIds.map((s) => s ?? "-").join(",")})`,
+      seenSessionIds.every(
+        (s) => typeof s === "string" && /^[A-Za-z0-9]{26}$/.test(s),
+      ),
+    `every summary call carries its own side-channel sessionId in opencode id format (26 base62, same construction as the main agent's sid) (${seenSessionIds.map((s) => s ?? "-").join(",")})`,
   );
 
   // ④ Overflow recovery re-primes the interrupted turn: after a suspected-

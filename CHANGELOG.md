@@ -8,6 +8,19 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.14] - 2026-09-20
+
+### Added
+- **SOCKS5 proxy for `webfetch` / `websearch`** (`cli/src/socks-proxy.ts`, `cli/src/general-tools.ts`, `cli/src/config.ts`): outbound web tools can now route through a SOCKS5 tunnel via a `proxy` config block (or `AIH_SOCKS5_PROXY=host:port`). Built on undici's official `Socks5ProxyAgent` (pure JS, no native deps) so it handles the CONNECT handshake, optional username/password auth, and the TLS wrap for HTTPS targets — and bundles cleanly into the offline package. With no proxy configured the direct path is used exactly as before.
+
+### Changed
+- **Auxiliary LLM calls now stream at the adapter level** (`core/src/seams/llm-openai.ts`, `core/src/agent-loop.ts`): side-calls that bypass the main loop's streaming (goal judge, `best_of_n`, MEA guardian/auditor, dream/title/branch distillation, compaction summary) previously emitted `stream:false` and were rejected (403) by gateways that only accept streaming from a keyless client. The adapter now owns the stream decision in one place so every such call is covered; the final text is still fully assembled and callers see no behavior change.
+- **Clean-slate offline packaging** (`scripts/offline-package`): the packaged default config ships **no providers, no models and no proxy** — a clean slate so each user configures their own endpoint after install. The build machine's local `aih.json` (providers, models, proxy, local endpoints) is stripped, not merged, so nothing machine-local leaks into the installer.
+- **Fresh-install startup guidance** (`cli/src/index.ts`): with nothing configured, `aih run` / `aih chat` no longer fail with a cryptic "no API key" / "no model id" error — the user is pointed at `aih connect` (catalog) or adding a provider to `aih.json`. Self-hosted / keyless endpoints need no key; `--mock` runs an offline demo.
+
+### Docs
+- **0.8.13 release page width** (`docs-site/style.css`): the content column was capped at 840px and left-aligned inside a ~1200px content area, leaving a large empty band on the right. The reading column is now wider and centered so the page uses its width properly on desktop while staying responsive on mobile.
+
 ## [0.8.13] - 2026-09-18
 
 ### Fixed

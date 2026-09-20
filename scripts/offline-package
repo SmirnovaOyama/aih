@@ -8,15 +8,17 @@
 #     aih / aih.cmd    ← launchers (ESM node script + cmd shim)
 #     lib/{core,cli,mcp-server}/  ← workspace dists + manifests
 #     node_modules/    ← FULL production dependency closure (no npm/net needed)
-#     config/global-config.json ← merged DEFAULT global config (see below)
+#     config/global-config.json ← clean DEFAULT global config (see below)
 #
-# Config handling follows aih's own layering rules (cli/src/config.ts):
-#   packaging merges legacy ~/.aih/config.json < global <XDG>/aih/config.json
-#   < ./aih.json (per top-level key, like runtime Object.assign) into ONE
-#   default; install deploys it to the RESOLVED global dir (AIH_HOME >
-#   $XDG_DATA_HOME/aih > ~/.local/share/aih, legacy ~/.aih compat) as
-#   config.json — never overwriting an existing one. Project overrides keep
-#   working via ./aih.json as usual.
+# Config handling: the packaged default ships NO providers, NO models and NO
+# proxy — it is a clean slate so the user can configure their own endpoint via
+# `aih connect` / `aih config` / `aih.json` after install (no key needed for
+# self-hosted / keyless endpoints). The build machine's local aih.json
+# (providers, models, proxy, local endpoints) is therefore STRIPPED, not
+# merged. Install deploys the clean config to the RESOLVED global dir
+# (AIH_HOME > $XDG_DATA_HOME/aih > ~/.local/share/aih, legacy ~/.aih compat)
+# as config.json — never overwriting an existing one. A user's own ./aih.json
+# keeps working as a project override.
 #
 # Install:   sh aih-*-offline.sh                    | powershell -ep Bypass -File aih-*-offline.ps1
 # Uninstall: sh aih-*-offline.sh uninstall [--purge-config]
@@ -34,6 +36,12 @@ cd "$(dirname "$0")/.."
 
 VERSION=$(grep -oE 'const VERSION = "[^"]+"' cli/src/index.ts | head -1 | sed 's/.*"\(.*\)"/\1/')
 [ -n "$VERSION" ] || VERSION=$(node -p "require('./package.json').version")
+# Minimum Node.js the packaged app needs, derived from undici's engines.node
+# (undici is a top-level import of the SOCKS5 proxy helper, so it loads on
+# every startup — its engine floor IS the app floor). Read dynamically so a
+# future undici bump raises the requirement automatically. Falls back to the
+# prior 20.18.1 floor if undici is absent (no SOCKS5 in that build).
+MIN_NODE=$(node -p "((require('./node_modules/undici/package.json').engines||{}).node||'>=20.18.1').replace(/^[<>=\s]+/,'')" 2>/dev/null || echo "20.18.1")
 OUT_DIR=${OUT_DIR:-dist-offline}
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
@@ -55,7 +63,18 @@ echo "==> staging full production dependency closure (offline)"
 node - "$STAGE" <<'NODE_EOF'
 const fs = require("fs"), path = require("path");
 const stage = process.argv[2];
-const roots = ["@modelcontextprotocol/sdk", "string-width", "zod"];
+// Roots = the DIRECT external deps of every workspace (core/cli/mcp-server),
+// read from their package.json. The previous hardcoded list silently dropped
+// any newly-added direct dependency (e.g. undici for SOCKS5) — the staged
+// tree then failed to resolve it at runtime. @aih/* are workspace symlinks,
+// not node_modules packages, so they are excluded.
+const roots = [];
+for (const ws of ["core", "cli", "mcp-server"]) {
+  const pj = JSON.parse(fs.readFileSync(path.join(ws, "package.json"), "utf8"));
+  for (const d of Object.keys(pj.dependencies ?? {})) {
+    if (!d.startsWith("@aih/")) roots.push(d);
+  }
+}
 const seen = new Set(), stack = [...roots];
 while (stack.length) {
   const name = stack.pop();
@@ -93,10 +112,12 @@ cat > "$STAGE/package.json" <<EOF
   "type": "module"
 }
 EOF
-echo "==> bundling merged global config (legacy < global < project)"
-# Merge the same layers runtime reads (per top-level key, later wins) into one
-# default config: legacy ~/.aih/config.json, then the resolved global
-# config.json, then ./aih.json. Mirrors cli/src/config.ts loadLayers().
+echo "==> bundling clean global config (no providers / models / proxy)"
+# The packaged default is a CLEAN SLATE: it ships no providers, no models and
+# no proxy, so the user configures their own endpoint after install (aih
+# connect / aih config / aih.json). We still read the same layers the runtime
+# reads to inherit any NON-model top-level settings the user has (e.g. skill
+# registries, agents), but strip providers/models/proxy from the result.
 node - "$STAGE" <<'NODE_EOF'
 const fs = require("fs"), path = require("path"), os = require("os");
 const stage = process.argv[2];
@@ -121,53 +142,16 @@ const merged = Object.assign(
   readJson(path.join(user, "config.json")),
   readJson("aih.json"),
 );
-// Opt-in: explicitly drop named providers from the packaged default (e.g.
-// local bare-IP llamacpp endpoints that live in the build machine's aih.json
-// but must not ship publicly). Comma-separated; the guard below still applies
-// to every provider that remains.
-const drop = (process.env.AIH_PACKAGE_DROP_PROVIDERS || "").split(",").map(s => s.trim()).filter(Boolean);
-if (drop.length && merged.providers) {
-  for (const name of drop) {
-    if (merged.providers[name]) {
-      delete merged.providers[name];
-      console.log(`    dropped provider (AIH_PACKAGE_DROP_PROVIDERS): ${name}`);
-    }
-  }
-}
-// Hard guarantee: the packaged default MUST carry models & providers —
-// refuse to build an installer without them.
-if (!merged.providers || !Object.keys(merged.providers).length) {
-  console.error("error: merged config has no providers — refusing to package");
-  process.exit(1);
-}
-// Security guard (post-v0.3.0 leak): a provider pointing at a private /
-// internal / bare-IP endpoint must never ship in a public installer. The
-// layering merge can silently pick these up from the build machine's local
-// aih.json — fail the build instead of leaking the address.
-const INTERNAL_HOST = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.0\.0\.0|\[?::1\]?$)|(\.internal$|\.local$|\.lan$)/i;
-for (const [name, p] of Object.entries(merged.providers)) {
-  if (!p.baseUrl || !p.model) {
-    console.error(`error: provider "${name}" is missing baseUrl/model — refusing to package`);
-    process.exit(1);
-  }
-  let host = "";
-  try {
-    host = new URL(p.baseUrl).hostname;
-  } catch {
-    console.error(`error: provider "${name}" baseUrl is not a valid URL (${p.baseUrl}) — refusing to package`);
-    process.exit(1);
-  }
-  if (
-    INTERNAL_HOST.test(host) ||
-    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) // any bare IPv4 literal — public IPs don't belong in shipped defaults either
-  ) {
-    console.error(
-      `error: provider "${name}" points at an internal/private endpoint (${host}) — ` +
-        `remove it from the packaged layers or override with a public URL before packaging`,
-    );
-    process.exit(1);
-  }
-}
+// Clean-slate packaging requirement: the shipped default carries NO providers,
+// NO models and NO proxy. The user configures their own endpoint after install
+// (aih connect / aih config / aih.json). Stripping providers/models is
+// therefore unconditional (no AIH_PACKAGE_DROP_PROVIDERS opt-in needed); the
+// proxy block is dropped too so no machine-local SOCKS5 endpoint ships.
+delete merged.providers;
+delete merged.models;
+delete merged.defaultProvider;
+delete merged.proxy;
+console.log("    stripped providers / models / defaultProvider / proxy from packaged default");
 // T1 P1 — secret-shape scan over the ENTIRE merged config (values, not just
 // provider fields). Non-provider top-level keys (custom headers, envFile
 // values, embedded tokens) would otherwise ship verbatim; the v0.3.0 fix
@@ -191,42 +175,6 @@ function scan(obj, path) {
     for (const [k, v] of Object.entries(obj)) scan(v, path ? `${path}.${k}` : k);
   }
 }
-// Packaged default: strip opencode's CLIENT-IDENTITY headers before they can
-// ship in a public installer. x-opencode-session / x-opencode-client /
-// x-opencode-project / x-opencode-request / user-agent identify the OPENCODE
-// official client — AIH must not impersonate it (ToS/red line, 2026-08-23).
-// Free models stay; users who want the zen tier configure headers themselves.
-const OPENCODE_IDENTITY_HEADERS = [
-  "x-opencode-session",
-  "x-opencode-client",
-  "x-opencode-project",
-  "x-opencode-request",
-  // user-agent identifies the opencode official client build too ("opencode/1.17.11
-  // ai-sdk/provider-utils/... runtime/bun/...") — strip it alongside the x-* set.
-  "user-agent",
-];
-for (const [name, p] of Object.entries(merged.providers || {})) {
-  if (!p.headers || typeof p.headers !== "object") continue;
-  if (!/^https?:\/\/([^/]*\.)?opencode\.ai(?:[:/]|$)/i.test(p.baseUrl || "")) continue;
-  let changed = false;
-  for (const h of OPENCODE_IDENTITY_HEADERS) {
-    if (p.headers[h]) {
-      delete p.headers[h];
-      changed = true;
-    }
-  }
-  if (changed) {
-    // Mark the provider keyless so buildRealLlm's "no API key" guard passes.
-    // opencode zen free tier authenticates by IP/routing, not by an API key —
-    // the identity headers were only for rate-limit pool routing and prompt-cache
-    // affinity. Without them (stripped above) AND without a key, the startup
-    // check `!apiKey && !keyless && !headerExempt` throws "no API key". Setting
-    // keyless: true is the correct signal: this provider genuinely needs no key.
-    p.keyless = true;
-    console.log(`    stripped opencode identity headers from provider: ${name} (marked keyless)`);
-    if (Object.keys(p.headers).length === 0) delete p.headers;
-  }
-}
 scan(merged, "");
 fs.mkdirSync(path.join(stage, "config"), { recursive: true });
 fs.writeFileSync(
@@ -234,7 +182,7 @@ fs.writeFileSync(
   JSON.stringify(merged, null, 2) + "\n",
 );
 console.log("    keys: " + Object.keys(merged).join(", "));
-if (merged.providers) console.log("    providers: " + Object.keys(merged.providers).join(", "));
+console.log("    (clean slate: no providers / models / proxy shipped)");
 NODE_EOF
 
 echo "==> writing launcher"
@@ -374,12 +322,21 @@ fi
 # at all. Requires network ONLY for this download step. The bin launcher is a
 # shell wrapper (not a symlink) that resolves node at runtime, so 'aih' keeps
 # working even after the system node disappears or PATH changes.
-NODE_VERSION="${AIH_NODE_VERSION:-v22.14.0}"
+# Default download version must satisfy MIN_NODE (undici's engine floor).
+# v22.19.0 is exactly that floor for undici 8.10.2; AIH_NODE_VERSION overrides.
+NODE_VERSION="${AIH_NODE_VERSION:-v22.19.0}"
 NODE_DIR="\$(app_dir)/.node"
+MIN_NODE="${MIN_NODE}"
+# Full semver comparison (major.minor.patch), not just the major version —
+# undici's engine floor is 22.19.0, so a bare "major >= 20" let Node 20.20.2
+# through and crashed on webidl.util.markAsUncloneable.
+node_ok() {
+  [ "\$(node -p 'const [a,b,c]=process.versions.node.split(".").map(Number),[m,n,p]=process.argv[1].split(".").map(Number);
+    (a>m)||(a===m&&(b>n||(b===n&&c>=p)))' "\$MIN_NODE" 2>/dev/null)" = "true" ]
+}
 NODE_BIN=""
 if command -v node >/dev/null 2>&1; then
-  NMAJOR=\$(node -p 'parseInt(process.versions.node.split(".")[0], 10)' 2>/dev/null || echo 0)
-  [ "\$NMAJOR" -ge 20 ] && NODE_BIN="\$(command -v node)"
+  node_ok && NODE_BIN="\$(command -v node)"
 fi
 OS="linux"; [ "\$(uname -s)" = "Darwin" ] && OS="darwin"
 ARCH="x64";  [ "\$(uname -m)" = "aarch64" ] && ARCH="arm64"
@@ -396,7 +353,7 @@ if [ -z "\$NODE_BIN" ]; then
   fi
 fi
 if [ -z "\$NODE_BIN" ]; then
-  say "no usable Node.js (need >= 20) — downloading \$NODE_VERSION (\$OS-\$ARCH) into \$NODE_DIR"
+  say "no usable Node.js (need >= \$MIN_NODE) — downloading \$NODE_VERSION (\$OS-\$ARCH) into \$NODE_DIR"
   mkdir -p "\$NODE_DIR"
   URL="https://nodejs.org/dist/\$NODE_VERSION/node-\$NODE_VERSION-\$OS-\$ARCH.tar.gz"
   TMPTAR="\$NODE_DIR/node.tar.gz"
@@ -405,7 +362,7 @@ if [ -z "\$NODE_BIN" ]; then
   elif command -v wget >/dev/null 2>&1; then
     wget -q "\$URL" -O "\$TMPTAR" || fail "failed to download Node.js from \$URL"
   else
-    fail "no curl or wget — install Node.js >= 20 manually, or install curl/wget"
+    fail "no curl or wget — install Node.js >= \$MIN_NODE manually, or install curl/wget"
   fi
   tar -xzf "\$TMPTAR" -C "\$NODE_DIR" || fail "failed to extract Node.js from \$TMPTAR"
   rm -f "\$TMPTAR"
@@ -433,6 +390,7 @@ mkdir -p "\$BIN"
 # be a different tree from the app dir, e.g. ~/.local/bin vs ~/.local/share/aih/app).
 APP_BAKED="\$APP"
 NODE_VERSION_BAKED="\$NODE_VERSION"
+MIN_NODE_BAKED="\$MIN_NODE"
 OS_BAKED="\$OS"
 ARCH_BAKED="\$ARCH"
 cat > "\$BIN/aih" <<'LAUNCHER'
@@ -442,13 +400,13 @@ APP="APP_BAKED"
 NODE_BIN="\$APP/.node/node-NODE_VERSION_BAKED-OS_BAKED-ARCH_BAKED/bin/node"
 [ -x "\$NODE_BIN" ] || NODE_BIN="\$(command -v node 2>/dev/null || true)"
 if [ -z "\$NODE_BIN" ]; then
-  printf '✗ node not found — AIH needs Node.js >= 20 (reinstall to auto-download it)\n' >&2
+  printf '✗ node not found — AIH needs Node.js >= MIN_NODE_BAKED (reinstall to auto-download it)\n' >&2
   exit 1
 fi
 export AIH_NODE_BIN="\$NODE_BIN"
 exec "\$NODE_BIN" "\$APP/lib/cli/dist/index.js" "\$@"
 LAUNCHER
-sed -i "s|APP_BAKED|\$APP_BAKED|g; s|NODE_VERSION_BAKED|\$NODE_VERSION_BAKED|g; s|OS_BAKED|\$OS_BAKED|g; s|ARCH_BAKED|\$ARCH_BAKED|g" "\$BIN/aih"
+sed -i "s|APP_BAKED|\$APP_BAKED|g; s|NODE_VERSION_BAKED|\$NODE_VERSION_BAKED|g; s|MIN_NODE_BAKED|\$MIN_NODE_BAKED|g; s|OS_BAKED|\$OS_BAKED|g; s|ARCH_BAKED|\$ARCH_BAKED|g" "\$BIN/aih"
 chmod +x "\$BIN/aih"
 say "wrote \$BIN/aih (node-resolving launcher)"
 
@@ -592,13 +550,19 @@ if ($Action -ne "install") {
 # Prefer a system node >= 20; otherwise download a portable Node.js binary
 # into $AppDir\.node and use it. The .cmd shim bakes the resolved node path,
 # so 'aih' keeps working even after the system node disappears or PATH changes.
-$NodeVersion = if ($env:AIH_NODE_VERSION) { $env:AIH_NODE_VERSION } else { "v22.14.0" }
+$NodeVersion = if ($env:AIH_NODE_VERSION) { $env:AIH_NODE_VERSION } else { "v22.19.0" }
+$MinNode = "__MIN_NODE__"
+# Full semver comparison (major.minor.patch), not just the major version —
+# undici's engine floor is 22.19.0, so a bare "major >= 20" let Node 20.20.2
+# through and crashed on webidl.util.markAsUncloneable.
+function Test-NodeOk([string]$min) {
+  $ok = & node -p "const [a,b,c]=process.versions.node.split('.').map(Number),[m,n,p]=$min.split('.').map(Number);
+    (a>m)||(a===m&&(b>n||(b===n&&c>=p)))" 2>$null
+  return $ok -eq "true"
+}
 $NodeResolved = ""
 $node = Get-Command node -ErrorAction SilentlyContinue
-if ($node) {
-  $nMajor = [int](& node -p "parseInt(process.versions.node.split('.')[0], 10)" 2>$null)
-  if ($nMajor -ge 20) { $NodeResolved = "node" }
-}
+if ($node -and (Test-NodeOk $MinNode)) { $NodeResolved = "node" }
 if (-not $NodeResolved) {
   $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
   $nodeDir = Join-Path $AppDir ".node"
@@ -623,12 +587,12 @@ if (-not $NodeResolved) {
   New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
   $zip = Join-Path $nodeDir "node.zip"
   $url = "https://nodejs.org/dist/$NodeVersion/node-$NodeVersion-win-$arch.zip"
-  Say ("no usable Node.js (need >= 20) - downloading " + $NodeVersion + " (" + $arch + ") into " + $nodeDir)
+  Say ("no usable Node.js (need >= " + $MinNode + ") - downloading " + $NodeVersion + " (" + $arch + ") into " + $nodeDir)
   try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
   } catch {
-    Fail ("failed to download Node.js from " + $url + " - install Node.js >= 20 manually")
+    Fail ("failed to download Node.js from " + $url + " - install Node.js >= " + $MinNode + " manually")
   }
   try {
     Expand-Archive -Path $zip -DestinationPath $nodeDir -Force
@@ -724,7 +688,7 @@ awk -v blockfile=/tmp/_payload_block.txt '
 ' "$OFFLINE_PS1" > /tmp/_ps1_new && mv /tmp/_ps1_new "$OFFLINE_PS1"
 rm /tmp/_payload_block.txt
 
-sed -i "s/__VERSION__/$VERSION/g" "$OFFLINE_PS1"
+sed -i "s/__VERSION__/$VERSION/g; s/__MIN_NODE__/$MIN_NODE/g" "$OFFLINE_PS1"
 
 echo "==> sanity: .ps1 payload round-trips byte-for-byte"
 awk '/^\$PayloadB64 = @"$/{f=1;next} /^"@$/{f=0} f' "$OFFLINE_PS1" | tr -d '\r\n' | base64 -d | cmp -s - "$PAYLOAD_TGZ_WIN" \
