@@ -34,22 +34,32 @@ for ws in core cli mcp-server; do
 done
 
 echo "==> resolving runtime deps (prod only)"
-S17=$(node -p "require('./cli/package.json').dependencies['@modelcontextprotocol/sdk']")
-ZOD=$(node -p "require('./mcp-server/package.json').dependencies['zod']")
-SW=$(node -p "require('./cli/package.json').dependencies['string-width']")
-cat > "$STAGE/package.json" <<EOF
-{
-  "name": "aih",
-  "version": "$VERSION",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "$S17",
-    "string-width": "$SW",
-    "zod": "$ZOD"
+# Derive the runtime dep set DYNAMICALLY from the workspaces' package.json
+# (later workspace wins on name collision; @aih/* internal links excluded).
+# Previously this list was hardcoded (sdk/string-width/zod) so a NEW runtime
+# dep added to a workspace (e.g. undici for SOCKS5) was silently missing from
+# the tarball and the staged-tree sanity check failed. Dynamic derivation is
+# the owner-level fix: add a dep to a workspace and it ships automatically.
+node - "$STAGE" "$VERSION" <<'NODE_EOF'
+const fs = require("fs");
+const [stage, version] = process.argv.slice(2);
+const deps = {};
+for (const ws of ["core", "cli", "mcp-server"]) {
+  const pj = JSON.parse(fs.readFileSync(`${ws}/package.json`, "utf8"));
+  for (const [name, range] of Object.entries(pj.dependencies ?? {})) {
+    if (!name.startsWith("@aih/")) deps[name] = range;
   }
 }
-EOF
+fs.writeFileSync(
+  `${stage}/package.json`,
+  JSON.stringify(
+    { name: "aih", version, private: true, type: "module", dependencies: deps },
+    null,
+    2,
+  ) + "\n",
+);
+console.log("    deps: " + Object.keys(deps).join(", "));
+NODE_EOF
 (cd "$STAGE" && npm install --omit=dev --no-audit --no-fund >/dev/null)
 
 # node_modules/@aih/* — REAL COPIES, not symlinks (scripts/offline-package's
