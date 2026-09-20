@@ -77,6 +77,7 @@ import {
   savePermissionRule,
   saveProvider,
   saveSkillRegistry,
+  loadProxy,
   type ModelCatalogEntry,
 } from "./config.js";
 import { buildSafetyHooks, ESCALATE_EXIT_CODE } from "./safety.js";
@@ -84,6 +85,7 @@ import type { SafetyHooks } from "./safety.js";
 import { projectTrustState, setProjectTrustState, sanitizeCredential } from "./config.js";
 import { recordModelUse, readMru, sortByRecent } from "./mru.js";
 import { collectRulesSync, renderRules } from "./rules.js";
+import { socksFetch, resolveSocksProxy } from "./socks-proxy.js";
 import { migrateConfigFile, configMigrationTargets } from "./migrate.js";
 import { buildKeybindDispatch, loadKeybinds } from "./keybinds.js";
 import {
@@ -747,6 +749,17 @@ function buildRealLlm(flags: Record<string, string | boolean>, sessionId?: strin
   ) {
     headers["x-opencode-session"] = "{sid}";
   }
+  // SOCKS5 proxy for LLM requests (config `proxy.socks5` / AIH_SOCKS5_PROXY).
+  // When configured, inject a fetchImpl that routes every request through the
+  // tunnel (undici Socks5ProxyAgent — handles CONNECT + TLS wrap). This is a
+  // general capability: any provider's LLM call can go through a SOCKS
+  // endpoint (self-hosted networks, corporate egress, supported-region exits).
+  // No core changes — OpenAICompatibleLLM accepts a caller-supplied fetchImpl.
+  const socks = resolveSocksProxy(loadProxy());
+  const fetchImpl = socks
+    ? async (input: string | URL | Request, init?: RequestInit) =>
+        (await socksFetch(input.toString(), init as Record<string, unknown>, socks)) as Response
+    : undefined;
   return new OpenAICompatibleLLM({
     baseUrl: resolved.baseUrl.value ?? "https://api.openai.com/v1",
     apiKey,
@@ -755,6 +768,7 @@ function buildRealLlm(flags: Record<string, string | boolean>, sessionId?: strin
     ...(retries !== undefined ? { retries } : {}),
     ...(Object.keys(headers).length > 0 ? { headers } : {}),
     ...(resolved.extraTools && resolved.extraTools.length > 0 ? { extraTools: resolved.extraTools } : {}),
+    ...(fetchImpl ? { fetchImpl } : {}),
     ...(sessionId ? { sessionId } : {}),
     // OC#7 — credential ownership isolation: a credential failure on this
     // provider degrades ITS OWNER (recorded for `aih models`/doctor/status);
